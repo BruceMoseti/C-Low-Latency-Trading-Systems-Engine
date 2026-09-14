@@ -106,6 +106,7 @@ void RecoveryServer::stop() {
 }
 
 void RecoveryServer::run() {
+    std::vector<std::thread> sessions;
     while (running_.load(std::memory_order_acquire)) {
         const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
         if (client_fd < 0) {
@@ -114,8 +115,23 @@ void RecoveryServer::run() {
             }
             break;
         }
-        serve_connection(client_fd);
-        ::close(client_fd);
+        // One thread per subscriber. Serving them one at a time would mean a
+        // second subscriber is never answered while the first holds the socket
+        // open, which is the normal case for a fan-out feed.
+        if (sessions.size() >= kMaxSessions) {
+            ::close(client_fd);
+            rejected_sessions_.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        sessions.emplace_back([this, client_fd] {
+            serve_connection(client_fd);
+            ::close(client_fd);
+        });
+    }
+    for (std::thread& session : sessions) {
+        if (session.joinable()) {
+            session.join();
+        }
     }
 }
 
@@ -128,10 +144,16 @@ void RecoveryServer::serve_connection(int client_fd) {
 
     std::vector<MarketMessage> scratch(kMaxRecoveryBatch);
 
-    // The client keeps one connection open and pipelines requests over it.
+    // The client keeps one connection open and pipelines requests over it. Gaps
+    // are bursty, so a quiet stretch between them is expected and must not cost
+    // the connection.
     while (running_.load(std::memory_order_acquire)) {
         RecoveryRequest request{};
-        if (!read_exact(client_fd, &request, sizeof(request))) {
+        const FrameResult result = read_frame(client_fd, &request, sizeof(request));
+        if (result == FrameResult::IdleTimeout) {
+            continue;
+        }
+        if (result != FrameResult::Ok) {
             return;
         }
         if (request.magic != kRecoveryMagic || request.to_sequence < request.from_sequence) {

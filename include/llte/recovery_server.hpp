@@ -53,8 +53,13 @@ public:
     std::uint64_t served_messages() const {
         return served_messages_.load(std::memory_order_relaxed);
     }
+    std::uint64_t rejected_sessions() const {
+        return rejected_sessions_.load(std::memory_order_relaxed);
+    }
 
 private:
+    static constexpr std::size_t kMaxSessions = 16;
+
     void run();
     void serve_connection(int client_fd);
 
@@ -64,6 +69,7 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<std::uint64_t> served_requests_{0};
     std::atomic<std::uint64_t> served_messages_{0};
+    std::atomic<std::uint64_t> rejected_sessions_{0};
 };
 
 }  // namespace llte

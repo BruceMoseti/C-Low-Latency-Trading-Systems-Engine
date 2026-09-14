@@ -32,6 +32,10 @@ RecoveryClient::~RecoveryClient() { close(); }
 
 bool RecoveryClient::connect(const std::string& host, std::uint16_t port, int timeout_ms,
                              std::string& error) {
+    host_ = host;
+    port_ = port;
+    timeout_ms_ = timeout_ms;
+
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
@@ -64,8 +68,34 @@ bool RecoveryClient::connect(const std::string& host, std::uint16_t port, int ti
     return false;
 }
 
+bool RecoveryClient::reconnect(std::string& error) {
+    close();
+    if (host_.empty()) {
+        error = "recovery client was never connected";
+        return false;
+    }
+    reconnects_ += 1;
+    return connect(host_, port_, timeout_ms_, error);
+}
+
 bool RecoveryClient::request(std::uint64_t from, std::uint64_t to,
                              std::vector<MarketMessage>& out, std::string& error) {
+    if (try_request(from, to, out, error)) {
+        return true;
+    }
+    // One retry on a fresh connection. The server closes an idle session, and a
+    // gap can be the first traffic in a while, so the first failure is usually
+    // just a stale socket rather than an unreachable exchange.
+    std::string reconnect_error;
+    if (!reconnect(reconnect_error)) {
+        error += "; reconnect failed: " + reconnect_error;
+        return false;
+    }
+    return try_request(from, to, out, error);
+}
+
+bool RecoveryClient::try_request(std::uint64_t from, std::uint64_t to,
+                                 std::vector<MarketMessage>& out, std::string& error) {
     out.clear();
     if (fd_ < 0) {
         error = "recovery client is not connected";
