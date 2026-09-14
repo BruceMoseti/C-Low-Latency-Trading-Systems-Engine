@@ -140,8 +140,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install matplotlib
-        run: python3 -m pip install --quiet matplotlib
+        run: python -m pip install --quiet matplotlib
 
       # Catches a figure script that no longer parses the committed logs, which
       # would mean the README's charts had drifted from the runs behind them.
