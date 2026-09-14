@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -35,8 +36,20 @@ struct MarketMessage {
     std::uint16_t reserved;
 };
 
+// The struct goes onto the wire as raw bytes, so the layout is part of the
+// protocol. Size alone would not catch two same-width fields being swapped, so
+// every offset is pinned individually.
 static_assert(std::is_trivially_copyable_v<MarketMessage>);
 static_assert(sizeof(MarketMessage) == 48, "wire layout must stay fixed");
+static_assert(offsetof(MarketMessage, sequence_number) == 0);
+static_assert(offsetof(MarketMessage, timestamp_ns) == 8);
+static_assert(offsetof(MarketMessage, order_id) == 16);
+static_assert(offsetof(MarketMessage, price) == 24);
+static_assert(offsetof(MarketMessage, quantity) == 32);
+static_assert(offsetof(MarketMessage, symbol_id) == 36);
+static_assert(offsetof(MarketMessage, type) == 40);
+static_assert(offsetof(MarketMessage, side) == 41);
+static_assert(offsetof(MarketMessage, reserved) == 42);
 
 constexpr const char* to_string(MessageType type) {
     switch (type) {

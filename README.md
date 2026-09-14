@@ -22,7 +22,9 @@ Three processes, two transports, one shared-memory queue:
 
 ## Quick start
 
-Needs Linux, CMake 3.20+ and a C++20 compiler. No third-party libraries.
+Needs Linux, CMake 3.20+ and a C++20 compiler. The engine, the tests and the
+benchmarks have no third-party dependencies; only the optional figure script needs
+matplotlib.
 
 ```bash
 ./scripts/build.sh                    # configure and build into ./build
@@ -386,6 +388,11 @@ does not connect to any venue.
 
 Specifically:
 
+- The wire format is the host's in-memory layout, with no byte-order conversion and
+  no version field. That is deliberate for a single-host pipeline and it is why the
+  offsets are pinned by `static_assert`, but it means the format is not portable
+  across architectures and has no story for rolling upgrades. A real feed would
+  specify endianness and carry a version.
 - The simulator produces a market-data stream, not executions; it generates plausible
   order flow and never matches an aggressive order against the book.
 - Recovery is synchronous on the receive thread, at the measured cost above.
