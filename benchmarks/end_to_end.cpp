@@ -93,14 +93,24 @@ int main(int argc, char** argv) {
     const auto seed = static_cast<std::uint64_t>(args.integer("seed", 5));
     const int producer_cpu = static_cast<int>(args.integer("producer-cpu", -1));
     const int consumer_cpu = static_cast<int>(args.integer("consumer-cpu", -1));
+    // Offered load. Running flat out fills the ring and turns every stage
+    // measurement into queueing delay, so the default paces below saturation and
+    // --rate 0 is reserved for measuring maximum throughput.
+    const auto rate = static_cast<std::uint64_t>(args.integer("rate", 1'000'000));
     if (batch < 1) batch = 1;
     if (batch > llte::kMaxBatch) batch = llte::kMaxBatch;
 
     const std::vector<llte::MarketMessage> stream = build_stream(message_count, seed);
-    std::printf("end_to_end: %zu messages, batch=%u\n", stream.size(), batch);
+    std::printf("end_to_end: %zu messages, batch=%u, offered load=%s\n", stream.size(), batch,
+                rate == 0 ? "unthrottled" : (std::to_string(rate) + " msg/s").c_str());
 
     Ring ring;
     std::atomic<bool> producer_done{false};
+    // Both threads allocate sizeable state before their first message. Without a
+    // barrier the consumer is still building its book while the producer is
+    // already publishing, and that startup gap shows up as a multi-millisecond
+    // tail that has nothing to do with steady-state behaviour.
+    std::atomic<bool> consumer_ready{false};
 
     llte::LatencySamples decode_stage(message_count);
     llte::LatencySamples sequence_stage(message_count);
@@ -109,18 +119,29 @@ int main(int argc, char** argv) {
     llte::LatencySamples total_stage(message_count);
     std::uint64_t consumed = 0;
 
-    const std::uint64_t start_ns = llte::now_ns();
+    std::atomic<std::uint64_t> measured_start_ns{0};
 
     std::thread producer([&] {
         llte::pin_to_cpu(producer_cpu);
         llte::SequenceManager sequencer(1 << 16, nullptr);
+        while (!consumer_ready.load(std::memory_order_acquire)) {
+        }
+        const std::uint64_t start_ns = llte::now_ns();
+        measured_start_ns.store(start_ns, std::memory_order_release);
         alignas(8) unsigned char packet[llte::kMaxPacketBytes];
         auto* header = reinterpret_cast<llte::FeedPacketHeader*>(packet);
         auto* payload =
             reinterpret_cast<llte::MarketMessage*>(packet + sizeof(llte::FeedPacketHeader));
 
+        const std::uint64_t interval_ns = rate > 0 ? 1'000'000'000ULL / rate : 0;
         std::size_t position = 0;
         while (position < stream.size()) {
+            if (interval_ns > 0) {
+                // Spin rather than sleep: a nanosleep would overshoot these gaps.
+                const std::uint64_t deadline = start_ns + position * interval_ns;
+                while (llte::now_ns() < deadline) {
+                }
+            }
             const std::uint16_t count = static_cast<std::uint16_t>(
                 std::min<std::size_t>(batch, stream.size() - position));
             header->magic = llte::kFeedMagic;
@@ -163,6 +184,7 @@ int main(int argc, char** argv) {
     std::thread consumer([&] {
         llte::pin_to_cpu(consumer_cpu);
         llte::OrderBook book({kMinPrice, kMaxPrice, 1 << 20});
+        consumer_ready.store(true, std::memory_order_release);
         llte::PipelineEvent event;
         for (;;) {
             if (!ring.try_pop(event)) {
@@ -199,7 +221,9 @@ int main(int argc, char** argv) {
     producer.join();
     consumer.join();
 
-    const double seconds = static_cast<double>(llte::now_ns() - start_ns) / 1e9;
+    const double seconds =
+        static_cast<double>(llte::now_ns() - measured_start_ns.load(std::memory_order_acquire)) /
+        1e9;
     std::printf("end_to_end: consumed %llu messages in %.3f s (%.2f M msg/s)\n\n",
                 static_cast<unsigned long long>(consumed), seconds,
                 static_cast<double>(consumed) / seconds / 1e6);

@@ -3,8 +3,8 @@
 //
 //   --mode=broken  two producer threads share one SpscQueue. Both advance the
 //                  same write index and write the same slot, so messages are
-//                  torn or lost. Built with -fsanitize=thread this reports a
-//                  data race on the queue's index and storage.
+//                  torn, lost, or the ring wedges. Built with -fsanitize=thread
+//                  this reports a data race on the index and the slot storage.
 //
 //   --mode=fixed   each producer owns a private SpscQueue and a single sequencer
 //                  thread is the only writer to the downstream queue. Same two
@@ -14,8 +14,8 @@
 // sequencer, and only the sequencer writes to the ring the book reads.
 
 #include <atomic>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <thread>
@@ -27,6 +27,13 @@
 namespace {
 
 constexpr std::size_t kQueueCapacity = 1024;
+
+// With two producers the indexes can be clobbered into a state where the ring
+// looks permanently full, so every spin here is bounded. Livelock is one of the
+// failure modes being demonstrated; hanging the demo is not. Once a producer
+// wedges it gives up rather than burning the budget again on every message,
+// which keeps the run quick even under ThreadSanitizer.
+constexpr std::uint64_t kSpinLimit = 2'000'000;
 
 struct Item {
     std::uint64_t producer;
@@ -45,26 +52,55 @@ struct Verdict {
     std::uint64_t received = 0;
     std::uint64_t corrupted = 0;
     std::uint64_t out_of_order = 0;
+    std::uint64_t stalled_pushes = 0;
+    bool consumer_gave_up = false;
 };
 
-void verify(const Item& item, std::vector<std::uint64_t>& next_expected, Verdict& verdict) {
-    verdict.received += 1;
-    if (item.producer >= next_expected.size() ||
-        item.checksum != checksum_for(item.producer, item.sequence)) {
-        verdict.corrupted += 1;
-        return;
+template <typename QueueType>
+bool push_bounded(QueueType& queue, const Item& item) {
+    for (std::uint64_t spins = 0; spins < kSpinLimit; ++spins) {
+        if (queue.try_push(item)) {
+            return true;
+        }
     }
-    if (item.sequence != next_expected[item.producer]) {
-        verdict.out_of_order += 1;
-    }
-    next_expected[item.producer] = item.sequence + 1;
+    return false;
 }
+
+class Verifier {
+public:
+    explicit Verifier(int producer_count) : next_expected_(producer_count, 0) {}
+
+    void check(const Item& item) {
+        received_ += 1;
+        if (item.producer >= next_expected_.size() ||
+            item.checksum != checksum_for(item.producer, item.sequence)) {
+            corrupted_ += 1;
+            return;
+        }
+        if (item.sequence != next_expected_[item.producer]) {
+            out_of_order_ += 1;
+        }
+        next_expected_[item.producer] = item.sequence + 1;
+    }
+
+    void publish(Verdict& verdict) const {
+        verdict.received = received_;
+        verdict.corrupted = corrupted_;
+        verdict.out_of_order = out_of_order_;
+    }
+
+private:
+    std::vector<std::uint64_t> next_expected_;
+    std::uint64_t received_ = 0;
+    std::uint64_t corrupted_ = 0;
+    std::uint64_t out_of_order_ = 0;
+};
 
 Verdict run_broken(int producer_count, std::uint64_t per_producer) {
     Queue queue;
     std::atomic<int> finished{0};
-    Verdict verdict;
-    verdict.sent = static_cast<std::uint64_t>(producer_count) * per_producer;
+    std::atomic<std::uint64_t> stalled{0};
+    std::atomic<bool> gave_up{false};
 
     std::vector<std::thread> producers;
     producers.reserve(producer_count);
@@ -75,21 +111,30 @@ Verdict run_broken(int producer_count, std::uint64_t per_producer) {
                                 checksum_for(static_cast<std::uint64_t>(id), i)};
                 // Two threads calling try_push on one SpscQueue: they race on the
                 // write index and can land on the same slot.
-                while (!queue.try_push(item)) {
+                if (!push_bounded(queue, item)) {
+                    stalled.fetch_add(per_producer - i, std::memory_order_relaxed);
+                    break;
                 }
             }
             finished.fetch_add(1, std::memory_order_release);
         });
     }
 
-    std::vector<std::uint64_t> next_expected(producer_count, 0);
+    Verifier verifier(producer_count);
     std::thread consumer([&] {
         Item item{};
+        std::uint64_t idle = 0;
         for (;;) {
             if (queue.try_pop(item)) {
-                verify(item, next_expected, verdict);
-            } else if (finished.load(std::memory_order_acquire) == producer_count &&
-                       queue.empty()) {
+                idle = 0;
+                verifier.check(item);
+                continue;
+            }
+            if (finished.load(std::memory_order_acquire) == producer_count && queue.empty()) {
+                return;
+            }
+            if (++idle > kSpinLimit) {
+                gave_up.store(true, std::memory_order_release);
                 return;
             }
         }
@@ -99,6 +144,12 @@ Verdict run_broken(int producer_count, std::uint64_t per_producer) {
         producer.join();
     }
     consumer.join();
+
+    Verdict verdict;
+    verdict.sent = static_cast<std::uint64_t>(producer_count) * per_producer;
+    verdict.stalled_pushes = stalled.load(std::memory_order_relaxed);
+    verdict.consumer_gave_up = gave_up.load(std::memory_order_acquire);
+    verifier.publish(verdict);
     return verdict;
 }
 
@@ -113,8 +164,7 @@ Verdict run_fixed(int producer_count, std::uint64_t per_producer) {
 
     std::atomic<int> finished{0};
     std::atomic<bool> sequencer_done{false};
-    Verdict verdict;
-    verdict.sent = static_cast<std::uint64_t>(producer_count) * per_producer;
+    std::atomic<std::uint64_t> stalled{0};
 
     std::vector<std::thread> producers;
     producers.reserve(producer_count);
@@ -123,7 +173,8 @@ Verdict run_fixed(int producer_count, std::uint64_t per_producer) {
             for (std::uint64_t i = 0; i < per_producer; ++i) {
                 const Item item{static_cast<std::uint64_t>(id), i,
                                 checksum_for(static_cast<std::uint64_t>(id), i)};
-                while (!inbound[id]->try_push(item)) {
+                if (!push_bounded(*inbound[id], item)) {
+                    stalled.fetch_add(1, std::memory_order_relaxed);
                 }
             }
             finished.fetch_add(1, std::memory_order_release);
@@ -137,30 +188,32 @@ Verdict run_fixed(int producer_count, std::uint64_t per_producer) {
             bool moved = false;
             for (auto& queue : inbound) {
                 if (queue->try_pop(item)) {
-                    while (!downstream.try_push(item)) {
+                    if (!push_bounded(downstream, item)) {
+                        stalled.fetch_add(1, std::memory_order_relaxed);
                     }
                     moved = true;
                 }
             }
-            if (!moved && finished.load(std::memory_order_acquire) == producer_count) {
-                bool drained = true;
-                for (auto& queue : inbound) {
-                    drained = drained && queue->empty();
-                }
-                if (drained) {
-                    sequencer_done.store(true, std::memory_order_release);
-                    return;
-                }
+            if (moved || finished.load(std::memory_order_acquire) != producer_count) {
+                continue;
+            }
+            bool drained = true;
+            for (auto& queue : inbound) {
+                drained = drained && queue->empty();
+            }
+            if (drained) {
+                sequencer_done.store(true, std::memory_order_release);
+                return;
             }
         }
     });
 
-    std::vector<std::uint64_t> next_expected(producer_count, 0);
+    Verifier verifier(producer_count);
     std::thread consumer([&] {
         Item item{};
         for (;;) {
             if (downstream.try_pop(item)) {
-                verify(item, next_expected, verdict);
+                verifier.check(item);
             } else if (sequencer_done.load(std::memory_order_acquire) && downstream.empty()) {
                 return;
             }
@@ -172,6 +225,11 @@ Verdict run_fixed(int producer_count, std::uint64_t per_producer) {
     }
     sequencer.join();
     consumer.join();
+
+    Verdict verdict;
+    verdict.sent = static_cast<std::uint64_t>(producer_count) * per_producer;
+    verdict.stalled_pushes = stalled.load(std::memory_order_relaxed);
+    verifier.publish(verdict);
     return verdict;
 }
 
@@ -202,8 +260,12 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(lost),
                 static_cast<unsigned long long>(verdict.corrupted),
                 static_cast<unsigned long long>(verdict.out_of_order));
+    std::printf("stalled_pushes=%llu consumer_gave_up=%s\n",
+                static_cast<unsigned long long>(verdict.stalled_pushes),
+                verdict.consumer_gave_up ? "yes" : "no");
 
-    const bool clean = lost == 0 && verdict.corrupted == 0 && verdict.out_of_order == 0;
+    const bool clean = lost == 0 && verdict.corrupted == 0 && verdict.out_of_order == 0 &&
+                       verdict.stalled_pushes == 0 && !verdict.consumer_gave_up;
     std::printf("result: %s\n", clean ? "stream intact" : "STREAM DAMAGED");
     // The broken mode is expected to fail; reporting it as success would defeat
     // the point of the demo.
