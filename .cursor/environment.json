@@ -1,5 +1,4 @@
 {
   "name": "C Low-Latency Trading Systems Engine",
-  "install": "./scripts/build.sh",
-  "start": "./scripts/build.sh"
+  "install": "./scripts/build.sh"
 }
