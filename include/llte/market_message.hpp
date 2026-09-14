@@ -11,6 +11,11 @@ enum class MessageType : std::uint8_t {
     Cancel = 2,
     Modify = 3,
     Trade = 4,
+    // Carries the next sequence number the venue will assign, so a receiver can
+    // tell "the feed is quiet" from "I missed the end of it". Without this a loss
+    // at the tail of the stream is undetectable: nothing arrives behind it to
+    // expose the hole. A heartbeat consumes no sequence number of its own.
+    Heartbeat = 5,
 };
 
 enum class Side : std::uint8_t {
@@ -57,6 +62,7 @@ constexpr const char* to_string(MessageType type) {
         case MessageType::Cancel: return "CANCEL";
         case MessageType::Modify: return "MODIFY";
         case MessageType::Trade: return "TRADE";
+        case MessageType::Heartbeat: return "HEARTBEAT";
     }
     return "?";
 }

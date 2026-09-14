@@ -31,6 +31,9 @@ void SequenceManager::accept(const FeedMessage& incoming) {
         expected_ = sequence;
         started_ = true;
     }
+    if (sequence > highest_seen_) {
+        highest_seen_ = sequence;
+    }
 
     if (sequence < expected_) {
         stats_.duplicates += 1;
@@ -97,6 +100,32 @@ void SequenceManager::recover_range(std::uint64_t from, std::uint64_t to) {
             stats_.unrecoverable += 1;
         }
     }
+}
+
+void SequenceManager::observe_heartbeat(std::uint64_t next_sequence) {
+    stats_.heartbeats += 1;
+    if (!started_ || next_sequence == 0) {
+        return;
+    }
+    const std::uint64_t published_through = next_sequence - 1;
+    if (published_through > highest_seen_) {
+        highest_seen_ = published_through;
+    }
+    flush_gaps();
+}
+
+void SequenceManager::flush_gaps() {
+    if (!started_ || expected_ > highest_seen_) {
+        return;
+    }
+    if (buffer_[expected_ % buffer_.size()].state != SlotState::Empty) {
+        return;
+    }
+    // The window cannot hold more than its capacity, so repair at most that much
+    // and let the next call continue from the new expected_.
+    const std::uint64_t limit =
+        std::min(highest_seen_, expected_ + buffer_.size() - 1);
+    recover_range(expected_, limit);
 }
 
 bool SequenceManager::next_deliverable(FeedMessage& out) {

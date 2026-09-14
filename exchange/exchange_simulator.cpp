@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
             "                          [--interface IP] [--messages N] [--rate PER_SEC]\n"
             "                          [--batch N] [--drop-rate F] [--seed N]\n"
             "                          [--history N] [--start-delay-ms N] [--linger-ms N]\n"
-            "                          [--cpu N] [--quiet]\n");
+            "                          [--heartbeat-ms N] [--cpu N] [--quiet]\n");
         return 0;
     }
 
@@ -71,6 +71,7 @@ int main(int argc, char** argv) {
     const auto seed = static_cast<std::uint64_t>(args.integer("seed", 42));
     const auto history_capacity = static_cast<std::size_t>(args.integer("history", 1 << 20));
     const int start_delay_ms = static_cast<int>(args.integer("start-delay-ms", 0));
+    const int heartbeat_ms = static_cast<int>(args.integer("heartbeat-ms", 25));
     const int linger_ms = static_cast<int>(args.integer("linger-ms", 2000));
     const int cpu = static_cast<int>(args.integer("cpu", -1));
     const bool quiet = args.has("quiet");
@@ -80,7 +81,7 @@ int main(int argc, char** argv) {
 
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
-    llte::pin_to_cpu(cpu);
+    llte::pin_to_cpu_or_warn(cpu, "exchange");
 
     llte::HistoryStore history(history_capacity);
     llte::RecoveryServer recovery_server(history);
@@ -121,6 +122,7 @@ int main(int argc, char** argv) {
     std::uint64_t packets_sent = 0;
     std::uint64_t packets_dropped = 0;
     std::uint64_t messages_dropped = 0;
+    std::uint64_t heartbeats_sent = 0;
     std::uint16_t pending = 0;
 
     const std::uint64_t interval_ns = rate_per_second > 0 ? 1'000'000'000ULL / rate_per_second : 0;
@@ -138,6 +140,33 @@ int main(int argc, char** argv) {
     // delay so it measures publishing, not waiting.
     sleep_ms(start_delay_ms);
     const std::uint64_t start_ns = llte::now_ns();
+    const std::uint64_t heartbeat_interval_ns =
+        heartbeat_ms > 0 ? static_cast<std::uint64_t>(heartbeat_ms) * 1'000'000ULL : 0;
+    std::uint64_t last_heartbeat_ns = start_ns;
+
+    // Announces the next sequence number the venue will assign, so a receiver can
+    // detect a loss with nothing behind it. Sent on its own datagram: bundling it
+    // with data would mean losing the data also loses the announcement about it.
+    auto send_heartbeat = [&]() {
+        llte::MarketMessage beat{};
+        beat.sequence_number = sequence;
+        beat.timestamp_ns = llte::now_ns();
+        beat.type = llte::MessageType::Heartbeat;
+        beat.symbol_id = 1;
+
+        alignas(8) unsigned char frame[sizeof(llte::FeedPacketHeader) +
+                                       sizeof(llte::MarketMessage)];
+        auto* frame_header = reinterpret_cast<llte::FeedPacketHeader*>(frame);
+        frame_header->magic = llte::kFeedMagic;
+        frame_header->count = 1;
+        frame_header->reserved = 0;
+        std::memcpy(frame + sizeof(llte::FeedPacketHeader), &beat, sizeof(beat));
+
+        std::string send_error;
+        if (publisher.send(frame, sizeof(frame), send_error)) {
+            heartbeats_sent += 1;
+        }
+    };
 
     auto flush_packet = [&]() {
         if (pending == 0) {
@@ -237,12 +266,24 @@ int main(int argc, char** argv) {
             if (!flush_packet()) {
                 return 1;
             }
+            const std::uint64_t now = llte::now_ns();
+            if (heartbeat_interval_ns > 0 && now - last_heartbeat_ns >= heartbeat_interval_ns) {
+                send_heartbeat();
+                last_heartbeat_ns = now;
+            }
             if (interval_ns > 0) {
                 busy_wait_until(start_ns + (published + 1) * interval_ns);
             }
         }
     }
     flush_packet();
+
+    // A burst at the end, because the last heartbeat is the one that tells a
+    // receiver the stream is complete, and a single copy of it can be dropped.
+    for (int i = 0; i < 5; ++i) {
+        send_heartbeat();
+        sleep_ms(20);
+    }
 
     const std::uint64_t elapsed_ns = llte::now_ns() - start_ns;
     const std::uint64_t produced = sequence - 1001;
@@ -256,9 +297,13 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(packets_sent),
                     static_cast<unsigned long long>(packets_dropped),
                     static_cast<unsigned long long>(messages_dropped));
+        std::printf("exchange: heartbeats sent=%llu\n",
+                    static_cast<unsigned long long>(heartbeats_sent));
         std::printf("exchange: book best_bid=%lld best_ask=%lld live_orders=%zu\n",
                     static_cast<long long>(book.best_bid()),
                     static_cast<long long>(book.best_ask()), book.live_order_count());
+        std::printf("exchange: book_digest=%016llx\n",
+                    static_cast<unsigned long long>(book.structural_digest()));
         std::fflush(stdout);
     }
 
