@@ -524,11 +524,19 @@ def figure_queue_variants(throughput, paced, repeats):
     save(fig, "queue_variants")
 
 
+BOOK_LABELS = {
+    "node-based, index unreserved": "node-based,\nindex\nunreserved",
+    "node-based, index reserved": "node-based,\nindex\nreserved",
+    "preallocated (shipped)": "preallocated\n(shipped)",
+}
+
+
 def figure_book_comparison(rows):
-    fig, axes = plt.subplots(1, 3, figsize=(11.4, 3.7))
+    fig, axes = plt.subplots(1, 3, figsize=(12.0, 4.0))
+    fig.subplots_adjust(wspace=0.34)
     fig.patch.set_facecolor(BACKGROUND)
-    labels = ["node-based\n(map + list)", "preallocated\n(shipped)"]
-    colors = [NEUTRAL, ACCENT]
+    labels = [BOOK_LABELS.get(r["label"], r["label"]) for r in rows]
+    colors = ["#c7ccd1", NEUTRAL, ACCENT][: len(rows)]
 
     def bars(ax, values, title, ylabel, fmt, log=False):
         drawn = ax.bar(range(len(values)), values, color=colors, width=0.56)
@@ -540,7 +548,7 @@ def figure_book_comparison(rows):
                     fmt(value), ha="center", va="bottom", fontsize=9.2,
                     color=INK, fontweight="bold")
         ax.set_xticks(range(len(values)))
-        ax.set_xticklabels(labels, fontsize=8.4, color=INK)
+        ax.set_xticklabels(labels, fontsize=7.8, color=INK, linespacing=1.4)
         ax.grid(True, axis="y", color=GRID, linewidth=0.8)
         ax.set_axisbelow(True)
         style(ax, title, None, ylabel)
@@ -550,20 +558,21 @@ def figure_book_comparison(rows):
     bars(axes[1], [max(r["allocs"], 0.6) for r in rows], "Heap allocations",
          "allocations (log scale)",
          lambda v: "0" if v < 1 else f"{int(v):,}", log=True)
-    bars(axes[2], [r["max"] / 1000.0 for r in rows], "Worst observed operation",
-         "microseconds (log scale)",
-         lambda v: f"{v:,.1f} \u00b5s" if v < 1000 else f"{v / 1000:,.1f} ms", log=True)
+    bars(axes[2], [r["p99"] for r in rows], "p99 per operation", "nanoseconds",
+         lambda v: f"{int(v)} ns")
 
     fig.suptitle(
-        "Preallocation is a tail-latency decision, not a throughput one",
-        x=0.007, y=1.08, ha="left", fontsize=13, fontweight="bold", color=INK,
+        "What preallocation actually buys, against a fairly configured baseline",
+        x=0.007, y=1.10, ha="left", fontsize=13, fontweight="bold", color=INK,
     )
     fig.text(
-        0.007, 1.0,
-        "2,000,000 mixed add/cancel/modify/trade operations against identical order flow. "
-        "Allocations are counted by replacing global operator new, measured after "
-        "construction so only steady-state work counts.",
-        ha="left", fontsize=9, color=MUTED,
+        0.007, 1.005,
+        "2,000,000 mixed add/cancel/modify/trade operations against identical order flow, "
+        "median of 5. The middle baseline differs from the left one by a single "
+        "index_.reserve() call, which removes a 36 ms rehash pause \u2014 so the shipped book "
+        "should be judged against the reserved column, where it wins on throughput, p99 and "
+        "allocation count but not at the median.",
+        ha="left", fontsize=8.6, color=MUTED,
     )
     save(fig, "book_comparison")
 

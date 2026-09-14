@@ -1,35 +1,40 @@
-run directory: /tmp/llte-run-2NEVAp
-messages=400000 drop-rate=0.001 rate=200000 batch=1 pin=1
+run directory: /tmp/llte-run-Y1Vjox
+messages=400000 drop-rate=0.001 rate=200000 batch=1 seed=42 pin=1
 
 ───────────────────────────── exchange ─────────────────────────────
 exchange: publishing 400000 messages to 239.1.1.1:30001 (batch=1, drop-rate=0.0010)
 exchange: recovery server listening on port 30002
-exchange: published 400000 messages in 2.000 s (200000 msg/s)
+exchange: published 400000 messages in 2.100 s (190438 msg/s)
 exchange: packets sent=399591 dropped=409 (messages dropped=409)
+exchange: heartbeats sent=84
 exchange: book best_bid=18749 best_ask=18751 live_orders=178442
-exchange: recovery served 410 requests / 491 messages
+exchange: book_digest=9c199374da16c565
+exchange: recovery served 410 requests / 710 messages
 
 ───────────────────────────── handler ─────────────────────────────
 handler: listening on 239.1.1.1:30001, publishing to shm /llte_feed
-handler: packets=399509 published=400000 malformed=0 queue_full_spins=0
-handler: gaps=410 missing=491 recovery_requests=410 recovered=491 unrecoverable=0 duplicates=0
-handler: throughput 200021 msg/s
+handler: packets=399369 published=400000 malformed=0 queue_full_spins=0
+handler: heartbeats=79 dropped_on_shutdown=0
+handler: gaps=410 missing=710 recovery_requests=410 recovered=710 unrecoverable=0 duplicates=0
+handler: throughput 200018 msg/s
 
 ───────────────────────────── engine ─────────────────────────────
 engine: attached to /llte_feed, draining events
 
-engine: consumed 400000 events (491 arrived via TCP recovery)
+engine: consumed 400000 events (710 arrived via TCP recovery)
 engine: applied=400000 unknown_order=0 duplicate=0 out_of_band=0
 engine: best_bid=18749 best_ask=18751 spread=2 live_orders=178442
-engine: consumer throughput 200022 msg/s
+engine: book_digest=9c199374da16c565
+engine: over_filled=0 unexpected_heartbeat=0
+engine: consumer throughput 200018 msg/s
 
 Per-stage latency (microseconds)
 stage                           count       p50       p90       p95       p99     p99.9       max
 -------------------------- ---------- --------- --------- --------- --------- --------- ---------
-udp recv -> parsed             400000    0.025u    0.026u    0.026u    0.033u    0.051u    3.535u
-parsed -> enqueue              400000    0.055u    0.058u    0.060u    0.076u   15.695u 2899.629u
-ring transit                   400000    0.321u    0.424u    0.440u    0.479u  133.084u  741.918u
-book update                    400000    0.148u    0.258u    0.325u    0.432u    0.587u   13.593u
-recv -> book (handler)         400000    0.557u    0.696u    0.765u    0.988u  133.765u 2900.877u
-exchange -> book (wire)        400000    5.511u    5.868u    6.057u   11.039u 1704.420u 2909.832u
+udp recv -> parsed             400000    0.026u    0.033u    0.033u    0.039u    0.060u   12.107u
+parsed -> enqueue              400000    0.052u    0.055u    0.056u    0.065u   15.401u 3985.127u
+ring transit                   400000    0.337u    0.447u    0.455u    0.520u   19.078u  138.246u
+book update                    400000    0.142u    0.222u    0.275u    0.401u    0.500u   15.719u
+recv -> book (handler)         400000    0.574u    0.702u    0.753u    0.918u   32.708u 3986.530u
+exchange -> book (wire)        400000    5.504u    5.778u    5.896u    8.607u 2286.758u 3996.042u
 

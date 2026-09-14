@@ -1,19 +1,22 @@
-run directory: /tmp/llte-run-RUGI78
-messages=400000 drop-rate=0 rate=200000 batch=1 pin=1
+run directory: /tmp/llte-run-NW8Obm
+messages=400000 drop-rate=0 rate=200000 batch=1 seed=42 pin=1
 
 ───────────────────────────── exchange ─────────────────────────────
 exchange: publishing 400000 messages to 239.1.1.1:30001 (batch=1, drop-rate=0.0000)
 exchange: recovery server listening on port 30002
-exchange: published 400000 messages in 2.000 s (200000 msg/s)
+exchange: published 400000 messages in 2.101 s (190415 msg/s)
 exchange: packets sent=400000 dropped=0 (messages dropped=0)
+exchange: heartbeats sent=84
 exchange: book best_bid=18749 best_ask=18751 live_orders=177846
+exchange: book_digest=7e211c6555e95578
 exchange: recovery served 0 requests / 0 messages
 
 ───────────────────────────── handler ─────────────────────────────
 handler: listening on 239.1.1.1:30001, publishing to shm /llte_feed
-handler: packets=400000 published=400000 malformed=0 queue_full_spins=0
+handler: packets=400079 published=400000 malformed=0 queue_full_spins=0
+handler: heartbeats=79 dropped_on_shutdown=0
 handler: gaps=0 missing=0 recovery_requests=0 recovered=0 unrecoverable=0 duplicates=0
-handler: throughput 200038 msg/s
+handler: throughput 200020 msg/s
 
 ───────────────────────────── engine ─────────────────────────────
 engine: attached to /llte_feed, draining events
@@ -21,15 +24,17 @@ engine: attached to /llte_feed, draining events
 engine: consumed 400000 events (0 arrived via TCP recovery)
 engine: applied=400000 unknown_order=0 duplicate=0 out_of_band=0
 engine: best_bid=18749 best_ask=18751 spread=2 live_orders=177846
-engine: consumer throughput 200039 msg/s
+engine: book_digest=7e211c6555e95578
+engine: over_filled=0 unexpected_heartbeat=0
+engine: consumer throughput 200020 msg/s
 
 Per-stage latency (microseconds)
 stage                           count       p50       p90       p95       p99     p99.9       max
 -------------------------- ---------- --------- --------- --------- --------- --------- ---------
-udp recv -> parsed             400000    0.025u    0.025u    0.025u    0.031u    0.034u    3.028u
-parsed -> enqueue              400000    0.054u    0.056u    0.057u    0.071u    0.108u    1.621u
-ring transit                   400000    0.366u    0.394u    0.404u    2.942u   27.501u  262.904u
-book update                    400000    0.165u    0.305u    0.374u    0.487u    0.626u    5.823u
-recv -> book (handler)         400000    0.605u    0.748u    0.826u    3.247u   27.859u  263.210u
-exchange -> book (wire)        400000    5.491u    5.780u    5.912u   10.698u  141.691u  385.997u
+udp recv -> parsed             400000    0.026u    0.026u    0.032u    0.033u    0.037u    2.834u
+parsed -> enqueue              400000    0.050u    0.055u    0.060u    0.063u    0.072u    0.798u
+ring transit                   400000    0.359u    0.396u    0.448u    0.494u    3.306u  140.760u
+book update                    400000    0.146u    0.220u    0.277u    0.401u    0.493u    3.787u
+recv -> book (handler)         400000    0.584u    0.687u    0.742u    0.871u    3.559u  141.102u
+exchange -> book (wire)        400000    5.486u    5.718u    5.817u    6.224u  127.570u  275.430u
 
