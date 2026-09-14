@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <thread>
 #include <vector>
@@ -104,7 +105,10 @@ int main(int argc, char** argv) {
     std::printf("end_to_end: %zu messages, batch=%u, offered load=%s\n", stream.size(), batch,
                 rate == 0 ? "unthrottled" : (std::to_string(rate) + " msg/s").c_str());
 
-    Ring ring;
+    // Heap, not stack: at 128 bytes per slot the ring is 8 MB, well past the
+    // default stack limit. In the real pipeline it lives in a shared mapping.
+    const auto ring_storage = std::make_unique<Ring>();
+    Ring& ring = *ring_storage;
     std::atomic<bool> producer_done{false};
     // Both threads allocate sizeable state before their first message. Without a
     // barrier the consumer is still building its book while the producer is
@@ -122,7 +126,7 @@ int main(int argc, char** argv) {
     std::atomic<std::uint64_t> measured_start_ns{0};
 
     std::thread producer([&] {
-        llte::pin_to_cpu(producer_cpu);
+        llte::require_pinned(producer_cpu, "producer");
         llte::SequenceManager sequencer(1 << 16, nullptr);
         while (!consumer_ready.load(std::memory_order_acquire)) {
         }
@@ -182,7 +186,7 @@ int main(int argc, char** argv) {
     });
 
     std::thread consumer([&] {
-        llte::pin_to_cpu(consumer_cpu);
+        llte::require_pinned(consumer_cpu, "consumer");
         llte::OrderBook book({kMinPrice, kMaxPrice, 1 << 20});
         consumer_ready.store(true, std::memory_order_release);
         llte::PipelineEvent event;
@@ -206,6 +210,8 @@ int main(int argc, char** argv) {
                 case llte::MessageType::Trade:
                     book.execute(message.order_id, message.quantity);
                     break;
+                case llte::MessageType::Heartbeat:
+                    break;  // build_stream never emits these
             }
             const std::uint64_t t4_book = llte::now_ns();
 

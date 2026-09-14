@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
     }
 
     const auto samples = static_cast<std::size_t>(args.integer("samples", 2'000'000));
-    llte::pin_to_cpu(static_cast<int>(args.integer("cpu", -1)));
+    llte::require_pinned(static_cast<int>(args.integer("cpu", -1)), "timer");
 
     llte::LatencySamples pair_cost(samples);
     for (std::size_t i = 0; i < samples; ++i) {

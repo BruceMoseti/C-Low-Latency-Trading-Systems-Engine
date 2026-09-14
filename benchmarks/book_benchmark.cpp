@@ -2,6 +2,7 @@
 // counts heap allocations to check the "no allocation on the hot path" claim
 // rather than asserting it.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdint>
@@ -104,8 +105,19 @@ std::vector<Operation> build_workload(std::uint64_t count, std::uint64_t seed) {
 
 // Baseline: the shape most people reach for first. Every level and every order
 // is a separately allocated node.
+//
+// The index is reservable because leaving it unreserved conflates two different
+// costs: node allocation, and one multi-millisecond rehash when the table grows.
+// Comparing against the unreserved version would credit preallocation with a
+// pause that a single reserve() call removes, so both are measured.
 class NodeBook {
 public:
+    explicit NodeBook(std::size_t index_reserve) {
+        if (index_reserve > 0) {
+            index_.reserve(index_reserve);
+        }
+    }
+
     void add(std::uint64_t id, Side side, Price price, std::uint32_t quantity) {
         auto& levels = side == Side::Buy ? bids_ : asks_;
         auto& orders = levels[price];
@@ -208,8 +220,9 @@ Result run_preallocated(const std::vector<Operation>& operations, std::size_t sa
     return result;
 }
 
-Result run_node_based(const std::vector<Operation>& operations, std::size_t sample_capacity) {
-    NodeBook book;
+Result run_node_based(const std::vector<Operation>& operations, std::size_t sample_capacity,
+                      std::size_t index_reserve) {
+    NodeBook book(index_reserve);
     llte::LatencySamples latency(sample_capacity);
 
     const std::uint64_t before = g_allocations.load(std::memory_order_relaxed);
@@ -238,8 +251,39 @@ Result run_node_based(const std::vector<Operation>& operations, std::size_t samp
     return result;
 }
 
+// The allocator's worst case swings by orders of magnitude between runs, so a
+// single `max` is not a measurement. Every row is repeated and summarised by its
+// median.
+Result median_of(std::vector<Result> results) {
+    auto middle_by = [&results](auto projection) {
+        std::vector<double> values;
+        values.reserve(results.size());
+        for (const Result& result : results) {
+            values.push_back(static_cast<double>(projection(result)));
+        }
+        std::sort(values.begin(), values.end());
+        return values[values.size() / 2];
+    };
+
+    Result summary;
+    summary.throughput_ops_per_sec = middle_by([](const Result& r) {
+        return r.throughput_ops_per_sec;
+    });
+    summary.allocations = static_cast<std::uint64_t>(
+        middle_by([](const Result& r) { return r.allocations; }));
+    summary.latency.p50 =
+        static_cast<std::uint64_t>(middle_by([](const Result& r) { return r.latency.p50; }));
+    summary.latency.p99 =
+        static_cast<std::uint64_t>(middle_by([](const Result& r) { return r.latency.p99; }));
+    summary.latency.p999 =
+        static_cast<std::uint64_t>(middle_by([](const Result& r) { return r.latency.p999; }));
+    summary.latency.max =
+        static_cast<std::uint64_t>(middle_by([](const Result& r) { return r.latency.max; }));
+    return summary;
+}
+
 void print_row(const std::string& label, const Result& result) {
-    std::printf("%-30s %12.2f %11llu %9llu %9llu %9llu %9llu\n", label.c_str(),
+    std::printf("%-34s %10.2f %12llu %8llu %8llu %9llu %11llu\n", label.c_str(),
                 result.throughput_ops_per_sec / 1e6,
                 static_cast<unsigned long long>(result.allocations),
                 static_cast<unsigned long long>(result.latency.p50),
@@ -253,24 +297,39 @@ void print_row(const std::string& label, const Result& result) {
 int main(int argc, char** argv) {
     const llte::Args args(argc, argv);
     if (args.has("help")) {
-        std::printf("usage: book_benchmark [--operations N] [--seed N]\n");
+        std::printf("usage: book_benchmark [--operations N] [--seed N] [--repeat N]\n");
         return 0;
     }
 
     const auto operation_count = static_cast<std::uint64_t>(args.integer("operations", 2'000'000));
     const auto seed = static_cast<std::uint64_t>(args.integer("seed", 11));
 
+    const int repeat = std::max(1, static_cast<int>(args.integer("repeat", 5)));
     const std::vector<Operation> workload = build_workload(operation_count, seed);
-    std::printf("book_benchmark: %zu operations\n\n", workload.size());
+    std::printf("book_benchmark: %zu operations, %d repeats, median reported\n\n",
+                workload.size(), repeat);
 
-    const Result preallocated = run_preallocated(workload, workload.size());
-    const Result node_based = run_node_based(workload, workload.size());
+    std::vector<Result> unreserved_runs, reserved_runs, preallocated_runs;
+    for (int attempt = 0; attempt < repeat; ++attempt) {
+        unreserved_runs.push_back(run_node_based(workload, workload.size(), 0));
+        reserved_runs.push_back(run_node_based(workload, workload.size(), 1u << 20));
+        preallocated_runs.push_back(run_preallocated(workload, workload.size()));
+    }
+    const Result unreserved = median_of(unreserved_runs);
+    const Result reserved = median_of(reserved_runs);
+    const Result preallocated = median_of(preallocated_runs);
 
-    std::printf("%-30s %12s %11s %9s %9s %9s %9s\n", "implementation", "M ops/s", "heap allocs",
-                "p50 ns", "p99 ns", "p99.9 ns", "max ns");
-    std::printf("%-30s %12s %11s %9s %9s %9s %9s\n", "------------------------------",
-                "------------", "-----------", "---------", "---------", "---------", "---------");
-    print_row("node-based (map + list)", node_based);
+    std::printf("%-34s %10s %12s %8s %8s %9s %11s\n", "implementation", "M ops/s",
+                "heap allocs", "p50 ns", "p99 ns", "p99.9 ns", "max ns");
+    std::printf("%-34s %10s %12s %8s %8s %9s %11s\n", "----------------------------------",
+                "----------", "------------", "--------", "--------", "---------", "-----------");
+    print_row("node-based, index unreserved", unreserved);
+    print_row("node-based, index reserved", reserved);
     print_row("preallocated (shipped)", preallocated);
+
+    std::printf(
+        "\nThe unreserved row's worst case is one rehash of a growing unordered_map, not\n"
+        "an allocation-per-operation cost: its allocation count is within a handful of\n"
+        "the reserved row's. Compare the shipped book against the reserved baseline.\n");
     return 0;
 }

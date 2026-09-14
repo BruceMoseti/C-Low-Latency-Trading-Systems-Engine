@@ -9,6 +9,7 @@
 //                              cached copies of the opposite index
 
 #include <algorithm>
+#include <cstdint>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -83,8 +84,16 @@ private:
     bool done_ = false;
 };
 
-// Variant 2: lock-free, but both indexes land on the same cache line.
-class FalseSharedQueue {
+// Variant 2: lock-free, with both indexes deliberately on one cache line.
+//
+// Leaving them merely adjacent is not enough to measure anything: whether they
+// share a line then depends on where the object happens to land, and moving it
+// eight bytes makes the effect disappear. The struct below is aligned and the
+// indexes are packed together, so the sharing is a property of the type.
+//
+// The payload buffer is line-aligned here exactly as it is in variant 3, so the
+// only difference between the two is where the indexes sit.
+class alignas(llte::kCacheLineBytes) FalseSharedQueue {
 public:
     bool try_push(const Item& value) {
         const std::size_t write = write_idx_.load(std::memory_order_relaxed);
@@ -111,11 +120,21 @@ public:
                write_idx_.load(std::memory_order_acquire);
     }
 
+    bool indexes_share_cache_line() const {
+        return line_of(&write_idx_) == line_of(&read_idx_);
+    }
+
 private:
-    // Deliberately adjacent: this is the anti-pattern being measured.
+    template <typename T>
+    static std::uintptr_t line_of(const T* address) {
+        return reinterpret_cast<std::uintptr_t>(address) / llte::kCacheLineBytes;
+    }
+
+    // Deliberately adjacent, and provably in one line: the type is 64-byte
+    // aligned and both indexes sit in its first 16 bytes.
     std::atomic<std::size_t> write_idx_{0};
     std::atomic<std::size_t> read_idx_{0};
-    Item buffer_[kCapacity]{};
+    alignas(llte::kCacheLineBytes) Item buffer_[kCapacity]{};
 };
 
 // Variant 3: separate cache lines, but every operation still reads the other
@@ -147,7 +166,16 @@ public:
                write_idx_.load(std::memory_order_acquire);
     }
 
+    bool indexes_share_cache_line() const {
+        return line_of(&write_idx_) == line_of(&read_idx_);
+    }
+
 private:
+    template <typename T>
+    static std::uintptr_t line_of(const T* address) {
+        return reinterpret_cast<std::uintptr_t>(address) / llte::kCacheLineBytes;
+    }
+
     alignas(llte::kCacheLineBytes) std::atomic<std::size_t> write_idx_{0};
     alignas(llte::kCacheLineBytes) std::atomic<std::size_t> read_idx_{0};
     alignas(llte::kCacheLineBytes) Item buffer_[kCapacity]{};
@@ -185,7 +213,7 @@ Outcome run_mutex(const RunConfig& config) {
     std::atomic<std::uint64_t> measured_start{0};
 
     std::thread producer([&] {
-        llte::pin_to_cpu(config.producer_cpu);
+        llte::require_pinned(config.producer_cpu, "producer");
         while (!consumer_ready.load(std::memory_order_acquire)) {
         }
         const std::uint64_t start = llte::now_ns();
@@ -198,7 +226,7 @@ Outcome run_mutex(const RunConfig& config) {
     });
 
     std::thread consumer([&] {
-        llte::pin_to_cpu(config.consumer_cpu);
+        llte::require_pinned(config.consumer_cpu, "consumer");
         Item item{};
         consumer_ready.store(true, std::memory_order_release);
         for (std::uint64_t received = 0; received < config.messages; ++received) {
@@ -229,7 +257,7 @@ Outcome run_spinning(const RunConfig& config) {
     std::atomic<std::uint64_t> measured_start{0};
 
     std::thread producer([&] {
-        llte::pin_to_cpu(config.producer_cpu);
+        llte::require_pinned(config.producer_cpu, "producer");
         while (!consumer_ready.load(std::memory_order_acquire)) {
         }
         const std::uint64_t start = llte::now_ns();
@@ -244,7 +272,7 @@ Outcome run_spinning(const RunConfig& config) {
     });
 
     std::thread consumer([&] {
-        llte::pin_to_cpu(config.consumer_cpu);
+        llte::require_pinned(config.consumer_cpu, "consumer");
         Item item{};
         consumer_ready.store(true, std::memory_order_release);
         for (;;) {
@@ -326,6 +354,24 @@ int main(int argc, char** argv) {
                     config.consumer_cpu);
     }
     std::printf("\n");
+
+    // The comparison is only meaningful if each variant has the layout it claims,
+    // so check rather than assume: a few bytes of drift would silently turn the
+    // false-sharing variant into the aligned one.
+    {
+        const FalseSharedQueue shared;
+        const AlignedQueue aligned;
+        const bool layout_ok = shared.indexes_share_cache_line() &&
+                               !aligned.indexes_share_cache_line();
+        std::printf("layout check: variant 2 indexes share a line=%s, variant 3 share=%s -> %s\n",
+                    shared.indexes_share_cache_line() ? "yes" : "no",
+                    aligned.indexes_share_cache_line() ? "yes" : "no",
+                    layout_ok ? "as intended" : "UNEXPECTED");
+        if (!layout_ok) {
+            std::fprintf(stderr, "queue_benchmark: variant layout is not as intended\n");
+            return 1;
+        }
+    }
 
     std::vector<Repeated> results;
     results.reserve(variants.size());
