@@ -53,6 +53,7 @@ llte_add_binary(order_book_engine orderbook/order_book_engine.cpp)
 llte_add_binary(queue_benchmark benchmarks/queue_benchmark.cpp)
 llte_add_binary(book_benchmark benchmarks/book_benchmark.cpp)
 llte_add_binary(end_to_end benchmarks/end_to_end.cpp)
+llte_add_binary(timer_overhead benchmarks/timer_overhead.cpp)
 
 llte_add_binary(spsc_race_demo tools/spsc_race_demo.cpp)
 

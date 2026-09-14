@@ -40,6 +40,9 @@ jobs:
       - name: Order book benchmark smoke
         run: ./build/book_benchmark --operations 200000
 
+      - name: Instrumentation floor
+        run: ./build/timer_overhead --samples 200000
+
       - name: Queue benchmark smoke
         run: ./build/queue_benchmark --messages 200000 --repeat 1
 

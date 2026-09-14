@@ -1,0 +1,8 @@
+timer_overhead: 2000000 back-to-back clock_gettime(CLOCK_MONOTONIC) pairs
+
+measurement                             min      p50      p90      p99
+---------------------------------- -------- -------- -------- --------
+cost of reading the clock twice        22 ns     24 ns     24 ns     25 ns
+
+Any stage reported at or near 24 ns is at the measurement floor: the number
+describes the instrumentation, not the work.

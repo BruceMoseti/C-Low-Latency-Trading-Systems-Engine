@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <type_traits>
 
 #include "llte/pipeline.hpp"
 #include "llte/spsc_queue.hpp"
@@ -22,6 +23,17 @@ struct ShmChannel {
     std::atomic<std::uint64_t> produced_count;
     EventQueue queue;
 };
+
+// A std::atomic that is not lock-free falls back to a lock held in whichever
+// process's memory it was constructed in, which would silently fail to
+// synchronize across the mapping. Cross-process use is only sound if these are
+// genuinely lock-free, so require it at compile time rather than hope.
+static_assert(std::atomic<std::size_t>::is_always_lock_free,
+              "the ring's indexes must be lock-free to work across processes");
+static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+static_assert(std::is_trivially_destructible_v<ShmChannel>,
+              "the channel outlives the process that created it");
 
 // RAII wrapper over shm_open/ftruncate/mmap. The creator constructs the channel
 // and publishes `ready`; the attacher spins until it sees that flag.

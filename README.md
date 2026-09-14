@@ -186,16 +186,25 @@ p95. Across the wire, including the kernel's UDP send and receive, the median is
 
 | stage | p50 | p90 | p95 | p99 | p99.9 |
 | --- | --- | --- | --- | --- | --- |
-| receive → decode | 0.025 µs | 0.025 µs | 0.025 µs | 0.031 µs | 0.034 µs |
+| receive → decode † | 0.025 µs | 0.025 µs | 0.025 µs | 0.031 µs | 0.034 µs |
 | decode → sequence → enqueue | 0.054 µs | 0.056 µs | 0.057 µs | 0.071 µs | 0.108 µs |
 | shared-memory ring transit | 0.366 µs | 0.394 µs | 0.404 µs | 2.942 µs | 27.50 µs |
 | order book update | 0.165 µs | 0.305 µs | 0.374 µs | 0.487 µs | 0.626 µs |
 | **total: receive → book** | **0.605 µs** | **0.748 µs** | **0.826 µs** | **3.247 µs** | **27.86 µs** |
 | exchange → book, across the wire | 5.491 µs | 5.780 µs | 5.912 µs | 10.70 µs | 141.7 µs |
 
-The ring transit tail is the honest weak point, and it is scheduler jitter rather
-than queueing: the consumer spins on an empty ring, and when the host deschedules it
-the next message waits. On a machine with isolated cores it would mostly disappear.
+† **This row is at the measurement floor and should not be read as a result.** Each
+stage boundary is a `clock_gettime(CLOCK_MONOTONIC)` call, and two back-to-back reads
+cost 24 ns on this machine — `benchmarks/timer_overhead` measures it, and the number
+is committed in [`docs/measurements/timer_overhead.log`](docs/measurements/timer_overhead.log).
+A stage reported at 25 ns is therefore describing the instrumentation, not the decode.
+The honest statement is that decoding costs less than the clock can see; the rows from
+`decode → enqueue` upward are comfortably above the floor, and the totals are the
+numbers worth quoting.
+
+The ring transit tail is the weak point, and it is scheduler jitter rather than
+queueing: the consumer spins on an empty ring, and when the host deschedules it the
+next message waits. On a machine with isolated cores it would mostly disappear.
 Nothing here is tuned — no core isolation, no busy-poll networking, no huge pages.
 
 ### What synchronous recovery costs
@@ -328,11 +337,18 @@ as a 5.4 ms p99 with nothing to do with steady state — and got *worse* with fe
 messages, which is what gave it away. Both benchmarks now hold the producer behind a
 start barrier until the consumer is in its loop.
 
+**The instrumentation has a floor, and one of the stages sits on it.** Two
+back-to-back clock reads cost 24 ns here, so the 25 ns "receive → decode" figure is
+the cost of measuring, not of decoding. That is disclosed next to the table rather
+than quoted as a 25 ns decode. It is also the reason the stage boundaries are kept
+coarse: timestamping more finely would measure the timestamps.
+
 Beyond that: percentiles come from full sorted sample sets rather than bucketed
-histograms, sample buffers are reserved up front so recording never allocates, the
-queue benchmark repeats every variant and reports a median with its range, and
-`CLOCK_MONOTONIC` is system-wide on Linux so stamps taken in three different
-processes are directly comparable.
+histograms, sample buffers are reserved up front so recording never allocates (and
+the engine is given a capacity above the message count, so no sample is dropped and
+the distribution is not truncated), the queue benchmark repeats every variant and
+reports a median with its range, and `CLOCK_MONOTONIC` is system-wide on Linux so
+stamps taken in three different processes are directly comparable.
 
 ## Verifying it yourself
 
@@ -347,6 +363,7 @@ BUILD_DIR=build-asan SANITIZER=address  ./scripts/build.sh && ctest --test-dir b
 BUILD_DIR=build-asan ./scripts/check_pipeline.sh --messages 100000 --rate 100000 --drop-rate 0.02
 
 # reproduce the measurements and regenerate every figure
+./build/timer_overhead  --cpu 2                    # the floor under every stage number
 ./build/queue_benchmark --messages 2000000 --repeat 7 --producer-cpu 2 --consumer-cpu 4
 ./build/book_benchmark  --operations 2000000
 ./scripts/run_pipeline.sh --messages 400000 --rate 200000 --drop-rate 0.02 --pin --csv /tmp/l.csv
