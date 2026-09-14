@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report toolchain
+        run: |
+          g++ --version | head -1
+          cmake --version | head -1
+          echo "cores: $(nproc)"
+
+      - name: Build
+        run: ./scripts/build.sh
+
+      - name: Unit and integration tests
+        run: ctest --test-dir build --output-on-failure
+
+      # The build script doubles as the dev-environment install command, so it has
+      # to stay safe to re-run against an existing build tree.
+      - name: Build script is idempotent
+        run: ./scripts/build.sh
+
+      - name: In-process pipeline smoke
+        run: ./build/end_to_end --messages 200000
+
+      - name: Order book benchmark smoke
+        run: ./build/book_benchmark --operations 200000
+
+      - name: Queue benchmark smoke
+        run: ./build/queue_benchmark --messages 200000 --repeat 1
+
+  pipeline:
+    name: End-to-end pipeline
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: ./scripts/build.sh
+
+      # A short run first: if the runner blocks multicast on loopback or denies
+      # POSIX shared memory, this fails in seconds with the three process logs
+      # attached rather than part-way through a long run.
+      - name: Smoke the three-process path
+        run: ./scripts/check_pipeline.sh --messages 5000 --rate 100000
+
+      - name: Reconstruct the book with no packet loss
+        run: ./scripts/check_pipeline.sh --messages 200000 --rate 200000
+
+      - name: Reconstruct the book through 2% packet loss
+        run: ./scripts/check_pipeline.sh --messages 200000 --rate 200000 --drop-rate 0.02
+
+      - name: Reconstruct the book with batched datagrams
+        run: ./scripts/check_pipeline.sh --messages 200000 --rate 200000 --drop-rate 0.01 --batch 8
+
+  sanitizers:
+    name: ${{ matrix.sanitizer }} sanitizer
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [thread, address]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with ${{ matrix.sanitizer }} sanitizer
+        run: BUILD_DIR=build-san SANITIZER=${{ matrix.sanitizer }} ./scripts/build.sh
+
+      - name: Tests under ${{ matrix.sanitizer }} sanitizer
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-san --output-on-failure
+
+      - name: In-process pipeline under ${{ matrix.sanitizer }} sanitizer
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1
+        run: ./build-san/end_to_end --messages 200000
+
+  ownership-contract:
+    name: SPSC single-producer contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with thread sanitizer
+        run: BUILD_DIR=build-tsan SANITIZER=thread ./scripts/build.sh
+
+      # The demo is only meaningful if both halves behave as claimed: two
+      # producers on one ring must be caught, and the sequencer design must not be.
+      - name: Two producers on one ring must damage the stream
+        run: |
+          set -uo pipefail
+          output=$(TSAN_OPTIONS=halt_on_error=0:exitcode=0 \
+            ./build-tsan/spsc_race_demo --mode broken --producers 2 --messages 20000 \
+            --time-budget-ms 2500 2>&1) && status=0 || status=$?
+          echo "$output"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::expected the multi-producer run to report a damaged stream"
+            exit 1
+          fi
+          if ! grep -q 'ThreadSanitizer: data race' <<<"$output"; then
+            echo "::error::expected ThreadSanitizer to report a data race"
+            exit 1
+          fi
+          echo "multi-producer misuse detected, as designed"
+
+      - name: One sequencer per ring must be race-free
+        run: |
+          set -euo pipefail
+          output=$(TSAN_OPTIONS=halt_on_error=0:exitcode=0 \
+            ./build-tsan/spsc_race_demo --mode fixed --producers 2 --messages 20000 \
+            --time-budget-ms 2500 2>&1)
+          echo "$output"
+          if grep -q 'ThreadSanitizer: data race' <<<"$output"; then
+            echo "::error::the single-producer design must not race"
+            exit 1
+          fi
+          grep -q 'result: stream intact' <<<"$output"
+
+  figures:
+    name: Figures match measurements
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install matplotlib
+        run: python3 -m pip install --quiet matplotlib
+
+      # Catches a figure script that no longer parses the committed logs, which
+      # would mean the README's charts had drifted from the runs behind them.
+      - name: Regenerate figures from committed measurements
+        run: python3 scripts/make_figures.py
+
+      - name: Analysis script runs
+        run: python3 scripts/analyze_latency.py --help
