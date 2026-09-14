@@ -25,6 +25,62 @@ namespace {
 volatile std::sig_atomic_t g_stop = 0;
 void handle_signal(int) { g_stop = 1; }
 
+// Drains everything the sequencer will release and pushes it into the ring.
+// Returns false when the loop should stop.
+//
+// The push is retried until it succeeds, shutdown is requested, or the consumer
+// has clearly stopped draining. A message that never entered the ring must not be
+// counted as published: that count is what the end-to-end check compares against,
+// so an over-count there turns a lossy run into a passing one.
+bool drain_sequencer(llte::SequenceManager& sequencer, llte::ShmChannel* channel,
+                     std::uint64_t& published, std::uint64_t& dropped_on_shutdown,
+                     std::uint64_t& queue_full_spins, std::uint64_t& first_message_ns,
+                     std::uint64_t& last_message_ns) {
+    // Bounds how long a full ring is tolerated before concluding the consumer is
+    // gone. Without it a dead consumer leaves the producer spinning forever.
+    constexpr std::uint64_t kPushDeadlineNs = 30ULL * 1'000'000'000ULL;
+
+    llte::FeedMessage deliverable;
+    while (sequencer.next_deliverable(deliverable)) {
+        llte::PipelineEvent event{};
+        event.msg = deliverable.message;
+        event.t0_recv = deliverable.t0_recv;
+        event.t1_parsed = deliverable.t1_parsed;
+        event.recovered = deliverable.recovered ? 1 : 0;
+        // Keep the first attempt as the enqueue stamp and account for the wait
+        // separately, so ring transit is not defined to exclude backpressure.
+        event.t2_enqueue = llte::now_ns();
+
+        bool pushed = false;
+        while (g_stop == 0) {
+            if (channel->queue.try_push(event)) {
+                pushed = true;
+                break;
+            }
+            queue_full_spins += 1;
+            const std::uint64_t blocked = llte::now_ns() - event.t2_enqueue;
+            if (blocked > kPushDeadlineNs) {
+                std::fprintf(stderr,
+                             "handler: ring full for %llu s; consumer is not draining\n",
+                             static_cast<unsigned long long>(blocked / 1'000'000'000ULL));
+                break;
+            }
+            event.enqueue_blocked_ns = blocked;
+        }
+
+        if (!pushed) {
+            dropped_on_shutdown += 1;
+            return false;
+        }
+        published += 1;
+        if (first_message_ns == 0) {
+            first_message_ns = event.t2_enqueue;
+        }
+        last_message_ns = event.t2_enqueue;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -35,7 +91,7 @@ int main(int argc, char** argv) {
             "                           [--recovery-host IP] [--recovery-port N]\n"
             "                           [--shm NAME] [--expect N] [--idle-ms N]\n"
             "                           [--startup-timeout-ms N] [--reorder N] [--cpu N]\n"
-            "                           [--no-recovery] [--quiet]\n");
+            "                           [--no-recovery] [--force-shm] [--quiet]\n");
         return 0;
     }
 
@@ -54,16 +110,17 @@ int main(int argc, char** argv) {
     const auto reorder = static_cast<std::size_t>(args.integer("reorder", 1 << 16));
     const int cpu = static_cast<int>(args.integer("cpu", -1));
     const bool use_recovery = !args.has("no-recovery");
+    const bool force_shm = args.has("force-shm");
     const bool quiet = args.has("quiet");
 
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
-    llte::pin_to_cpu(cpu);
+    llte::pin_to_cpu_or_warn(cpu, "handler");
 
     std::string error;
 
     llte::SharedMemoryQueue shm;
-    if (!shm.create(shm_name, error)) {
+    if (!shm.create(shm_name, error, force_shm)) {
         std::fprintf(stderr, "handler: shared memory failed: %s\n", error.c_str());
         return 1;
     }
@@ -99,6 +156,8 @@ int main(int argc, char** argv) {
     std::uint64_t queue_full_spins = 0;
     std::uint64_t malformed_packets = 0;
     std::uint64_t packets_received = 0;
+    std::uint64_t heartbeats_received = 0;
+    std::uint64_t dropped_on_shutdown = 0;
     std::uint64_t first_message_ns = 0;
     std::uint64_t last_message_ns = 0;
     int idle_elapsed_ms = 0;
@@ -123,6 +182,11 @@ int main(int argc, char** argv) {
                     break;
                 }
             } else if (idle_elapsed_ms >= idle_ms) {
+                // Last chance to repair a hole before giving up, in case the
+                // heartbeat that would have revealed it was dropped too.
+                sequencer.flush_gaps();
+                drain_sequencer(sequencer, channel, published, dropped_on_shutdown,
+                                queue_full_spins, first_message_ns, last_message_ns);
                 break;
             }
             continue;
@@ -147,29 +211,24 @@ int main(int argc, char** argv) {
 
         const auto* payload = reinterpret_cast<const llte::MarketMessage*>(
             packet + sizeof(llte::FeedPacketHeader));
-        const std::uint64_t t1_parsed = llte::now_ns();
         for (std::uint16_t i = 0; i < header->count; ++i) {
+            // Stamped per message rather than per datagram: with batching a single
+            // stamp copied across the batch would report one value repeated, and a
+            // percentile over repeated values says nothing.
+            const std::uint64_t t1_parsed = llte::now_ns();
+            if (payload[i].type == llte::MessageType::Heartbeat) {
+                // Not a book event. It states how far the feed has got, which is
+                // what exposes a loss with nothing behind it.
+                heartbeats_received += 1;
+                sequencer.observe_heartbeat(payload[i].sequence_number);
+                continue;
+            }
             sequencer.accept(llte::FeedMessage{payload[i], t0_recv, t1_parsed, false});
         }
 
-        llte::FeedMessage deliverable;
-        while (sequencer.next_deliverable(deliverable)) {
-            llte::PipelineEvent event{};
-            event.msg = deliverable.message;
-            event.t0_recv = deliverable.t0_recv;
-            event.t1_parsed = deliverable.t1_parsed;
-            event.recovered = deliverable.recovered ? 1 : 0;
-            event.t2_enqueue = llte::now_ns();
-
-            while (!channel->queue.try_push(event) && g_stop == 0) {
-                queue_full_spins += 1;
-                event.t2_enqueue = llte::now_ns();
-            }
-            published += 1;
-            if (first_message_ns == 0) {
-                first_message_ns = event.t2_enqueue;
-            }
-            last_message_ns = event.t2_enqueue;
+        if (!drain_sequencer(sequencer, channel, published, dropped_on_shutdown,
+                            queue_full_spins, first_message_ns, last_message_ns)) {
+            break;
         }
 
         channel->produced_count.store(published, std::memory_order_relaxed);
@@ -192,6 +251,9 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(published),
                     static_cast<unsigned long long>(malformed_packets),
                     static_cast<unsigned long long>(queue_full_spins));
+        std::printf("handler: heartbeats=%llu dropped_on_shutdown=%llu\n",
+                    static_cast<unsigned long long>(heartbeats_received),
+                    static_cast<unsigned long long>(dropped_on_shutdown));
         std::printf(
             "handler: gaps=%llu missing=%llu recovery_requests=%llu recovered=%llu "
             "unrecoverable=%llu duplicates=%llu\n",
