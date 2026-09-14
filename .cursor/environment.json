@@ -1,10 +1,5 @@
 {
   "name": "C Low-Latency Trading Systems Engine",
   "install": "./scripts/build.sh",
-  "terminals": [
-    {
-      "name": "build",
-      "command": "./scripts/build.sh && echo 'ready: run scripts/run_pipeline.sh or ctest --test-dir build'"
-    }
-  ]
+  "start": "./scripts/build.sh"
 }
