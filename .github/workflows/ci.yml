@@ -14,6 +14,7 @@ jobs:
   build-and-test:
     name: Build and test
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -49,6 +50,7 @@ jobs:
   pipeline:
     name: End-to-end pipeline
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -70,9 +72,23 @@ jobs:
       - name: Reconstruct the book with batched datagrams
         run: ./scripts/check_pipeline.sh --messages 200000 --rate 200000 --drop-rate 0.01 --batch 8
 
+      # A loss at the very end of the stream used to be undetectable, and a fixed
+      # seed hid it: only some drop patterns put a loss last. Varying the seed is
+      # what turns that class of bug from a rare flake into a reliable failure.
+      - name: Reconstruct the book across many loss patterns
+        run: |
+          set -euo pipefail
+          for seed in 1 7 18 23 42 57 90 111; do
+            ./scripts/check_pipeline.sh --messages 20000 --rate 200000 \
+              --drop-rate 0.02 --seed "$seed" > "/tmp/seed-$seed.log" 2>&1 || {
+                echo "::error::seed $seed failed"; cat "/tmp/seed-$seed.log"; exit 1; }
+            echo "seed $seed ok"
+          done
+
   sanitizers:
     name: ${{ matrix.sanitizer }} sanitizer
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -99,6 +115,7 @@ jobs:
   ownership-contract:
     name: SPSC single-producer contract
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -140,6 +157,7 @@ jobs:
   figures:
     name: Figures match measurements
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -153,7 +171,12 @@ jobs:
       # Catches a figure script that no longer parses the committed logs, which
       # would mean the README's charts had drifted from the runs behind them.
       - name: Regenerate figures from committed measurements
-        run: python3 scripts/make_figures.py
+        run: python scripts/make_figures.py
+
+      # The job name is a claim; without this it regenerates a drifted figure and
+      # passes. Any difference means a chart no longer matches the run behind it.
+      - name: Figures are unchanged by regeneration
+        run: git diff --exit-code -- docs/figures/
 
       - name: Analysis script runs
         run: python3 scripts/analyze_latency.py --help
