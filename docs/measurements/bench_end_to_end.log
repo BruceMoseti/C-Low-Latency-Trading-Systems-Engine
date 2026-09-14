@@ -1,0 +1,15 @@
+# saturation (throughput):
+end_to_end: 2000000 messages, batch=1, offered load=unthrottled
+end_to_end: consumed 2000000 messages in 0.590 s (3.39 M msg/s)
+
+# paced at 1 M msg/s (latency):
+end_to_end: 2000000 messages, batch=1, offered load=1000000 msg/s
+end_to_end: consumed 2000000 messages in 2.002 s (1.00 M msg/s)
+
+stage                           count       p50       p90       p95       p99     p99.9       max
+-------------------------- ---------- --------- --------- --------- --------- --------- ---------
+decode                        2000000    0.023u    0.024u    0.024u    0.025u    0.026u    5.855u
+sequence -> enqueue           2000000    0.035u    0.036u    0.037u    0.045u    0.058u    4.474u
+ring transit                  2000000    0.336u    0.353u    0.361u    0.717u    2.262u   97.843u
+book update                   2000000    0.091u    0.154u    0.169u    0.211u    0.363u   15.561u
+end to end                    2000000    0.490u    0.556u    0.577u    0.913u    3.513u   98.055u

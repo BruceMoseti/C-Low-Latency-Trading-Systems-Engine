@@ -1,0 +1,17 @@
+queue_benchmark: 2000000 messages per variant, 7 repeats (pinned: producer=2 consumer=4)
+
+saturation (producer unthrottled) -- throughput, median of 7
+variant                               M msg/s   observed range
+------------------------------ -------------- ----------------
+1. mutex + deque                         3.11    3.10 -   3.16
+2. lock-free, shared line                7.66    7.63 -   7.67
+3. lock-free, cache-aligned             12.99   12.83 -  13.63
+4. + cached indices (shipped)           18.46    9.27 -  31.90
+
+paced at 1.00 M msg/s -- handoff latency, median of 7
+variant                            p50 us     p99 us   p99.9 us
+------------------------------ ---------- ---------- ----------
+1. mutex + deque                    2.067      5.452      7.828
+2. lock-free, shared line           0.364      0.386      0.450
+3. lock-free, cache-aligned         0.315      0.331      0.355
+4. + cached indices (shipped)       0.298      0.317      0.411

@@ -1,0 +1,6 @@
+book_benchmark: 2000000 operations
+
+implementation                      M ops/s heap allocs    p50 ns    p99 ns  p99.9 ns    max ns
+------------------------------ ------------ ----------- --------- --------- --------- ---------
+node-based (map + list)                4.25     2864360       138       463      1631  34959084
+preallocated (shipped)                 7.54           0        89       201       274     45388

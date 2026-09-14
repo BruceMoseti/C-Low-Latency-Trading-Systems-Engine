@@ -1,0 +1,15 @@
+pipeline check: messages=200000 rate=200000 drop-rate=0.02 batch=1
+
+  ok    engine best bid matches exchange               18749
+  ok    engine best ask matches exchange               18751
+  ok    engine live order count matches exchange       89114
+  ok    handler published every message                200000
+  ok    engine consumed every message                  200000
+  ok    engine applied every message                   200000
+  ok    every gap was recovered                        3909
+  ok    no message abandoned                           0
+  ok    no malformed packet                            0
+  ok    no unknown order referenced                    0
+  ok    no out-of-band price                           0
+
+PASS  book reconstructed exactly; 3909 of 3909 gaps recovered over TCP

@@ -1,236 +1,280 @@
-# C-Low-Latency-Trading-Systems-Engine
+# Low-Latency Market Data Engine
 
-A small exchange simulator and a low-latency C++ market-data pipeline for Linux.
+[![CI](https://github.com/BruceMoseti/C-Low-Latency-Trading-Systems-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/BruceMoseti/C-Low-Latency-Trading-Systems-Engine/actions/workflows/ci.yml)
 
-The exchange publishes sequenced order-book updates over UDP multicast. A separate
-market-data process receives and validates those messages, detects missing sequence
-numbers, and requests the missing ones over a separate TCP recovery connection.
-Valid messages pass through a shared-memory SPSC ring buffer into a third process
-that maintains a preallocated central limit order book. Every stage is timestamped
-so the pipeline can be measured at p50 through p99.9 rather than on averages alone.
+A market-data pipeline in C++20 for Linux, built the way an exchange feed actually
+works: an exchange simulator publishes sequenced order-book events over UDP
+multicast, a handler process detects missing sequence numbers and repairs them over
+a separate TCP connection, and an order-book process consumes the repaired stream
+through a shared-memory ring buffer and maintains a preallocated central limit order
+book. Every hop is timestamped, so the pipeline is characterised by its tail — p99
+and p99.9 — rather than by an average.
 
-This is a study of the infrastructure around electronic trading — networking,
-sequencing, recovery, lock-free IPC, book maintenance and latency measurement. It is
-not a production trading system and does not connect to a real venue.
+![Architecture of the pipeline: an exchange simulator publishing over UDP multicast to a market-data handler, which repairs gaps over TCP and forwards an ordered stream through a shared-memory SPSC ring buffer into an order-book engine](docs/figures/architecture.png)
 
-## Architecture
+Three processes, two transports, one shared-memory queue:
 
-```
-                        exchange_simulator
-                   ┌──────────────────────────┐
-                   │ generates market events  │
-                   │ seq 1001, 1002, 1003 ... │
-                   │ keeps a history ring     │
-                   └────┬────────────────┬────┘
-                        │                │
-                UDP multicast      TCP recovery
-              (fast path, lossy)   (retransmission)
-                        │                ▲
-                        ▼                │
-                   ┌─────────────────────┴────┐
-                   │  market_data_handler     │
-                   │  recv -> parse -> verify │
-                   │  sequence gap detection  │
-                   │  SequenceManager is the  │
-                   │  single writer below     │
-                   └────────────┬─────────────┘
-                                │
-                   shared-memory SPSC ring buffer
-                       (POSIX shm, cache-aligned)
-                                │
-                                ▼
-                   ┌──────────────────────────┐
-                   │   order_book_engine      │
-                   │   ADD / CANCEL /         │
-                   │   MODIFY / TRADE         │
-                   │   preallocated CLOB      │
-                   │   per-stage latency      │
-                   └──────────────────────────┘
-```
-
-Instrumentation points, carried with each message through the ring:
-
-```
-T0 udp recv → T1 parsed → T2 enqueue → T3 dequeue → T4 book updated
-```
-
-## Build and run
-
-Requires Linux, CMake 3.20+ and a C++20 compiler.
-
-```bash
-./scripts/build.sh                 # configure + build into ./build
-ctest --test-dir build             # unit and integration tests
-./scripts/run_pipeline.sh --messages 400000 --rate 200000 --pin
-```
-
-`run_pipeline.sh` starts all three processes in dependency order and prints what
-each one saw. Useful options:
-
-| Option | Meaning |
+| Process | Responsibility |
 | --- | --- |
-| `--messages N` | messages the exchange publishes |
-| `--rate N` | publish rate in messages/second, `0` for unthrottled |
-| `--drop-rate F` | fraction of datagrams the exchange builds but never sends |
-| `--batch N` | messages per datagram |
-| `--pin` | pin each process to its own core |
-| `--csv PATH` | write per-message stage timings for `scripts/analyze_latency.py` |
+| `exchange_simulator` | generates order flow, maintains the authoritative book, assigns sequence numbers, publishes the feed, serves retransmissions |
+| `market_data_handler` | joins the group, validates and decodes packets, detects gaps, requests the missing range over TCP, emits one ordered stream |
+| `order_book_engine` | applies add/cancel/modify/trade to a preallocated book and reports the latency of every stage |
 
-`scripts/build.sh` defaults `CXX` to `g++`. On this image clang selects the GCC 14
-directory while only `libstdc++-13-dev` is installed, so it cannot find
-`libstdc++.so`; clang works if pointed at the right toolchain:
+## Quick start
+
+Needs Linux, CMake 3.20+ and a C++20 compiler. No third-party libraries.
 
 ```bash
-CXX=clang++ CXXFLAGS=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13 ./scripts/build.sh
+./scripts/build.sh                    # configure and build into ./build
+ctest --test-dir build                # 3 suites, ~33k assertions
+./scripts/check_pipeline.sh --messages 200000 --rate 200000 --drop-rate 0.02
 ```
 
-## Design decisions
+That last command starts all three processes, drops 2% of the datagrams on purpose,
+and then checks that the book the engine rebuilt is identical to the one the exchange
+actually had:
 
-**Integer prices.** Prices are `int64_t` ticks (cents), so `$187.53` is `18753`.
-Financial values need exact representation, and integer comparison keeps the book's
-hot path simple. There is no `double` anywhere in the message path.
+```
+pipeline check: messages=200000 rate=200000 drop-rate=0.02 batch=1
 
-**UDP multicast for the feed, TCP only for recovery.** Multicast gives one publisher
-cheap fan-out to many subscribers. It offers no delivery or ordering guarantee, so
-the receiver checks sequence numbers. Using TCP for everything would give reliable
-ordered delivery, but a retransmission stalls the whole stream behind the missing
-byte. Separating the two means a gap costs a targeted request instead of a
-head-of-line block on the fast path.
+  ok    engine best bid matches exchange               18749
+  ok    engine best ask matches exchange               18751
+  ok    engine live order count matches exchange       89114
+  ok    handler published every message                200000
+  ok    engine consumed every message                  200000
+  ok    engine applied every message                   200000
+  ok    every gap was recovered                        3909
+  ok    no message abandoned                           0
+  ok    no malformed packet                            0
+  ok    no unknown order referenced                    0
+  ok    no out-of-band price                           0
 
-**Single-producer ownership.** The ring buffer is SPSC, which is a correctness
-constraint rather than a performance note. The multicast path and the recovery path
-both feed the `SequenceManager`, and only the sequencer writes to the ring. The two
-sources converge *before* the queue, never at it. See "The race" below.
+PASS  book reconstructed exactly; 3909 of 3909 gaps recovered over TCP
+```
 
-**Cache-aligned atomics.** The producer writes `write_idx_` and the consumer writes
-`read_idx_`. Adjacent in memory they would share a cache line, so the two cores would
-invalidate each other's line on every operation despite never touching the same
-variable. They are `alignas(64)` on separate lines, each next to that side's cached
-copy of the opposite index.
+The gap count moves between runs, because on top of the injected drops the host loses
+a variable number of datagrams of its own. What does not move is the last line.
 
-**Acquire/release publication.** The producer fills the slot and then publishes the
+## How it works
+
+### The protocol
+
+One fixed-layout 48-byte struct carries every event. It is memcpy'd onto the wire
+with no serialization step, since both sides are built from the same source on the
+same host, and `static_assert` pins the layout so a field reorder cannot silently
+change the format.
+
+```cpp
+struct MarketMessage {
+    std::uint64_t sequence_number;   // gap detection hangs off this
+    std::uint64_t timestamp_ns;      // publish time, travels with retransmissions
+    std::uint64_t order_id;
+    Price         price;             // int64 ticks, never floating point
+    std::uint32_t quantity;
+    std::uint32_t symbol_id;
+    MessageType   type;              // Add / Cancel / Modify / Trade
+    Side          side;
+    std::uint16_t reserved;
+};
+```
+
+`$187.53` is stored as `18753`. Binary floating point cannot represent most decimal
+prices exactly, so money in a book belongs in integers; it also makes price
+comparison and the price-to-level index trivial.
+
+A datagram carries an 8-byte header and up to 32 messages. Batching amortises the
+`sendto` syscall; the receiver accepts any count within bounds and rejects anything
+whose declared length disagrees with the bytes received.
+
+### Two transports, on purpose
+
+Market data goes out over UDP multicast because one publisher can serve many
+subscribers without tracking any of them. The cost is that UDP guarantees nothing:
+the receiver will see `1001, 1002, 1004` and has to notice.
+
+Running the feed over TCP instead would make that impossible, but at a price that
+matters more: a single lost segment stalls everything behind it while the kernel
+retransmits, so one drop delays every later message. Splitting the paths means a gap
+costs one targeted request for one range, on a connection of its own, while the live
+feed keeps flowing.
+
+The handler detects a gap whenever an arriving sequence number is ahead of the one it
+expects, asks the exchange for exactly the missing range, and slots the replies into
+a reorder buffer. Anything recovery cannot supply — already aged out of the
+exchange's history ring — is marked skipped rather than left to stall the book
+forever behind a hole that will never be filled.
+
+![Message accounting under 2% injected packet loss: 7,991 datagrams dropped deliberately plus 1,942 dropped by the kernel gives 9,933 missing messages, all 9,933 recovered over TCP with none abandoned](docs/figures/recovery_accounting.png)
+
+### One writer per queue
+
+The handler and the engine are separate processes sharing a ring buffer through
+`shm_open` and `mmap`, so this is genuinely inter-process, not two threads described
+with borrowed vocabulary.
+
+The ring is single-producer, single-consumer. That is a correctness constraint, not a
+performance note, and it shapes the design: the natural way to add recovery is to let
+the recovery path publish downstream alongside the receive path, which quietly puts
+two writers on a queue built for one. Instead both sources feed the `SequenceManager`,
+and the sequencer is the only thing that ever writes to the ring. The two paths
+converge *before* the queue, never at it.
+
+Two details carry the performance:
+
+**The indexes live on separate cache lines.** The producer writes `write_idx_`, the
+consumer writes `read_idx_`. Adjacent in memory they share a 64-byte line, and the
+two cores then invalidate each other's copy on every single operation despite never
+touching the same variable. `alignas(64)` separates them, and each sits beside that
+side's private cached copy of the opposite index — so the common case does not read
+the other core's line at all.
+
+**Publication is release/acquire.** The producer fills the slot and then publishes the
 index with a release store; the consumer acquires the index before reading the slot.
-That ordering is what guarantees the consumer cannot observe a published index before
-the payload writes that preceded it.
+That pairing is what guarantees the consumer cannot observe a published index while
+the payload writes that preceded it are still invisible.
 
-**Preallocated, not "never allocates".** Every container is sized in the `OrderBook`
-constructor: a flat array of price levels indexed by `price - min_price`, a fixed
-order pool with an intrusive free list, and an open-addressed `order_id` index that
-uses backward-shift deletion so it needs neither tombstones nor a rehash pause. The
-claim is that the steady-state path performs no heap allocation, and the benchmark
-below counts allocations to check it.
+### The order book
 
-**Real IPC.** The handler and the book run as separate processes and share the ring
-through `shm_open` + `mmap`, so "inter-process" is accurate. Where components are
-threads rather than processes, this README says inter-thread.
+Price-time priority, with every container sized in the constructor:
 
-## Measured results
+- price levels in a flat array indexed by `price - min_price`, so finding a level is
+  an offset rather than a tree descent
+- orders from a fixed pool threaded on an intrusive free list, and an intrusive
+  doubly-linked list per level, which makes cancel an O(1) unlink
+- `order_id` to pool slot through an open-addressed table using backward-shift
+  deletion, so it needs neither tombstones nor the rehash pause they eventually force
+- best bid and ask tracked incrementally, scanning outward only when a touch level
+  empties
 
-All numbers below are from this repository on an 8-core Linux container, `-O2`,
-processes pinned. They are measurements from the runs in `scripts/`, not estimates.
+Modify follows real venue semantics: shrinking in place keeps time priority, while a
+price change or a size increase sends the order to the back of its new queue.
 
-### Pipeline, no injected loss
+"Preallocated" is a claim about the steady state, and the benchmark below measures it
+by replacing global `operator new` and counting, rather than asserting it in prose.
 
-400,000 messages at 200,000 msg/s. Nothing lost, so nothing recovered.
+## Results
 
-| stage | p50 | p90 | p99 | p99.9 | max |
-| --- | --- | --- | --- | --- | --- |
-| udp recv → parsed | 0.025 µs | 0.036 µs | 0.044 µs | 0.055 µs | 2.58 µs |
-| parsed → enqueue | 0.055 µs | 0.065 µs | 0.090 µs | 0.126 µs | 4.63 µs |
-| ring transit | 0.314 µs | 0.340 µs | 0.453 µs | 3.70 µs | 142 µs |
-| book update | 0.148 µs | 0.246 µs | 0.422 µs | 0.536 µs | 9.53 µs |
-| **recv → book** | **0.549 µs** | **0.677 µs** | **0.871 µs** | **4.01 µs** | **143 µs** |
-| exchange → book (wire) | 5.42 µs | 5.76 µs | 6.93 µs | 22.9 µs | 317 µs |
+All numbers below come from the logs committed under
+[`docs/measurements/`](docs/measurements), on an 8-core Linux container with `-O2` and
+processes pinned. The figures are generated from those same logs by
+`scripts/make_figures.py`, so a chart cannot drift from the run behind it.
 
-The engine's reconstructed book matched the exchange's authoritative book exactly:
-`best_bid=18749 best_ask=18751 live_orders=177846` on both sides.
+### The book reconstructs exactly
 
-### Pipeline with packet loss and recovery
+400,000 messages at 200,000 msg/s. With the exchange dropping 2% of datagrams, the
+accounting closes with nothing left over:
 
-Same run with the exchange dropping 2% of datagrams:
-
-```
-exchange: packets sent=392009 dropped=7991 (messages dropped=7991)
-handler:  packets=389053 gaps=7773 missing=10947 recovered=10947 unrecoverable=0
-engine:   consumed 400000 events (10947 arrived via TCP recovery), applied=400000
-engine:   best_bid=18749 best_ask=18751 live_orders=178442   (matches the exchange)
-```
-
-The accounting closes exactly: 7,991 datagrams were dropped deliberately and a
-further 2,956 were lost by the kernel under load (392,009 sent − 389,053 received).
-That is 10,947 missing messages, all 10,947 recovered over TCP, none abandoned. The
-book still reconstructs exactly.
-
-### The cost of synchronous recovery
-
-Splitting end-to-end latency by how each message arrived shows a real tradeoff:
-
-| loss rate | gaps | fast path p99 | fast path p99.9 | recovery path p50 | recovery path p90 |
-| --- | --- | --- | --- | --- | --- |
-| 0.1% | 411 | 7.96 µs | 2513 µs | 31.7 µs | 1124 µs |
-| 2% | 7,773 | 2400 µs | 3849 µs | 26.8 µs | 1435 µs |
-
-Recovery is a round trip, so recovered messages are naturally slower — that part is
-expected. The interesting result is the *fast path* degrading at 2% loss. Recovery is
-synchronous: when the handler detects a gap it blocks on TCP while multicast packets
-pile up in the socket buffer, and those queued messages are then measured late. The
-gap rate decides which percentile absorbs the stall — at 411 gaps in 400,000 messages
-it lands on p99.9, at 7,773 gaps it reaches p99. Moving recovery off the receive
-thread would fix this, at the cost of reintroducing the second producer that the
-sequencer design exists to avoid.
-
-### Queue variants
-
-2,000,000 messages, producer and consumer pinned to separate cores. Throughput is
-measured with the producer unthrottled; latency is measured separately at a paced
-1 M msg/s, because at saturation the ring simply stays full and "latency" degenerates
-into a measure of queue depth.
-
-| variant | throughput | paced p50 | paced p99 |
-| --- | --- | --- | --- |
-| 1. mutex + deque (bounded to same depth) | 3.87 M msg/s | 2.398 µs | 5.71 µs |
-| 2. lock-free, both indexes on one line | 7.34 M msg/s | 0.370 µs | 0.404 µs |
-| 3. lock-free, cache-aligned indexes | 12.67 M msg/s | 0.327 µs | 2.26 µs |
-| 4. + producer/consumer-cached indexes (shipped) | 22.13 M msg/s | 0.290 µs | 2.38 µs |
-
-Throughput is where the design differences show: removing the mutex roughly doubles
-it, separating the cache lines adds ~1.7x, and caching the opposite index adds
-another ~1.7x by avoiding a cross-core read on every operation. At a paced 1 M msg/s
-the ring is nearly empty and all three lock-free variants land within noise of each
-other above p50 — the ordering at p99 there is not meaningful, and this table does not
-claim otherwise.
-
-Pinning mattered enough to be worth stating: unpinned, variant 4 measured anywhere
-from 11.7 to 30.1 M msg/s depending on where the scheduler placed the two threads.
-
-### Order book
-
-2,000,000 mixed add/cancel/modify/trade operations. Allocations are counted by
-overriding global `operator new`, measured after construction so only steady-state
-work is counted.
-
-| implementation | throughput | heap allocations | p50 | p99 | p99.9 | max |
+| | injected drops | kernel drops | missing | recovered | abandoned | applied |
 | --- | --- | --- | --- | --- | --- | --- |
-| node-based (`std::map` + `std::list`) | 4.20 M ops/s | 2,864,360 | 140 ns | 487 ns | 1658 ns | 34.97 ms |
-| preallocated (shipped) | 7.29 M ops/s | **0** | 93 ns | 231 ns | 404 ns | 28.3 µs |
+| 400,000 messages, 2% loss | 7,991 | 1,942 | 9,933 | 9,933 | 0 | 400,000 |
 
-Zero allocations on the steady-state path, measured rather than asserted. The tail is
-the real story: the node-based book's worst case is 35 ms against 28 µs, which is what
-allocator and container growth pauses cost a latency-sensitive consumer.
+The kernel drops are real, not simulated: the exchange put 392,009 datagrams on the
+wire and the handler received 390,067, so 1,942 were lost by the host under load.
+Added to the 7,991 deliberate drops that is exactly the 9,933 gaps the handler
+reported. Every one was retransmitted, and both processes finished holding the same
+book — `best_bid=18749 best_ask=18751 live_orders=178442`.
 
-### In-process pipeline
+### Latency through the pipeline
+
+![Per-stage latency with no packet loss, showing receive to decode at 0.025 microseconds p50, ring transit at 0.366, book update at 0.165, and a total receive-to-book of 0.605 microseconds p50](docs/figures/stage_breakdown.png)
+
+With no loss, the handler-to-book path costs 0.605 µs at the median and 0.826 µs at
+p95. Across the wire, including the kernel's UDP send and receive, the median is
+5.491 µs.
+
+| stage | p50 | p90 | p95 | p99 | p99.9 |
+| --- | --- | --- | --- | --- | --- |
+| receive → decode | 0.025 µs | 0.025 µs | 0.025 µs | 0.031 µs | 0.034 µs |
+| decode → sequence → enqueue | 0.054 µs | 0.056 µs | 0.057 µs | 0.071 µs | 0.108 µs |
+| shared-memory ring transit | 0.366 µs | 0.394 µs | 0.404 µs | 2.942 µs | 27.50 µs |
+| order book update | 0.165 µs | 0.305 µs | 0.374 µs | 0.487 µs | 0.626 µs |
+| **total: receive → book** | **0.605 µs** | **0.748 µs** | **0.826 µs** | **3.247 µs** | **27.86 µs** |
+| exchange → book, across the wire | 5.491 µs | 5.780 µs | 5.912 µs | 10.70 µs | 141.7 µs |
+
+The ring transit tail is the honest weak point, and it is scheduler jitter rather
+than queueing: the consumer spins on an empty ring, and when the host deschedules it
+the next message waits. On a machine with isolated cores it would mostly disappear.
+Nothing here is tuned — no core isolation, no busy-poll networking, no huge pages.
+
+### What synchronous recovery costs
+
+Splitting end-to-end latency by how each message arrived shows a trade-off worth
+naming.
+
+![Latency distributions on log-log axes. With no loss the handler path and wire path both stay flat to p99. Under 2% loss, the TCP recovery path is slower by design, but the multicast fast path also degrades](docs/figures/latency_distribution.png)
+
+| loss rate | gaps | fast path p99 | fast path p99.9 | recovery p50 | recovery p90 |
+| --- | --- | --- | --- | --- | --- |
+| none | 0 | 10.70 µs | 141.7 µs | — | — |
+| 0.1% | 410 | 9.271 µs | 1700 µs | 27.70 µs | 448.6 µs |
+| 2% | 7,799 | 1404 µs | 3801 µs | 26.62 µs | 1277 µs |
+
+Retransmitted messages being slower is expected — they cost a round trip. The
+interesting result is the *fast path* degrading as loss rises. Recovery is
+synchronous on the receive thread, so while the handler blocks on TCP, multicast
+packets queue in the socket buffer and are then measured late. The gap rate decides
+which percentile absorbs the stall: at 410 gaps in 400,000 messages it sits out at
+p99.9, at 7,799 gaps it has reached p99.
+
+Moving recovery onto its own thread would fix it, and would immediately reintroduce
+the second writer the sequencer exists to prevent — the fix is a queue-per-source
+feeding the sequencer, which is exactly the shape `tools/spsc_race_demo --mode fixed`
+demonstrates. It is not implemented here, so the limitation stands as measured.
+
+### The queue design, measured rather than assumed
+
+Four ways to move a message between two threads, same payload, same capacity,
+producer and consumer pinned to separate cores.
+
+![Queue variant comparison. Sustained throughput rises from 3.11 to 7.66 to 12.99 million messages per second across mutex, false-shared and cache-aligned variants; the cached-index variant has a median of 18.46 but a range from 9.27 to 31.90](docs/figures/queue_variants.png)
+
+| variant | throughput, median of 7 | observed range | paced p50 | paced p99 |
+| --- | --- | --- | --- | --- |
+| mutex + deque, same capacity | 3.11 M msg/s | 3.10 – 3.16 | 2.067 µs | 5.452 µs |
+| lock-free, indexes share a cache line | 7.66 M msg/s | 7.63 – 7.67 | 0.364 µs | 0.386 µs |
+| lock-free, indexes on separate lines | 12.99 M msg/s | 12.83 – 13.63 | 0.315 µs | 0.331 µs |
+| + cached opposite index (shipped) | 18.46 M msg/s | 9.27 – 31.90 | 0.298 µs | 0.317 µs |
+
+Dropping the mutex is worth 2.5x and splitting the cache line another 1.7x, both
+tightly repeatable. Caching the opposite index is the interesting one: it improves
+latency slightly and consistently, but its throughput is bimodal across a 3.4x range,
+because the producer only reloads the consumer's index when it believes the ring is
+full — so the benefit depends on whether the consumer is keeping up. Reporting its
+median alone would overstate a result that is really "sometimes much faster, sometimes
+level with the previous variant". Unpinned, the spread is wider still.
+
+Note also what the latency column does *not* show: at a paced 1 M msg/s the ring stays
+near-empty and all three lock-free variants land within a few tens of nanoseconds of
+each other. The design differences show up in sustained throughput, not in handoff
+latency at a modest offered load.
+
+### Preallocation is a tail-latency decision
+
+![Order book comparison. The preallocated book reaches 7.54 million operations per second with zero heap allocations and a 45 microsecond worst case, against 4.25 million, 2.86 million allocations and a 35 millisecond worst case for a node-based book](docs/figures/book_comparison.png)
+
+2,000,000 mixed add/cancel/modify/trade operations against identical order flow:
+
+| implementation | throughput | heap allocations | p50 | p99 | p99.9 | worst |
+| --- | --- | --- | --- | --- | --- | --- |
+| node-based (`std::map` + `std::list`) | 4.25 M ops/s | 2,864,360 | 138 ns | 463 ns | 1631 ns | 34.96 ms |
+| preallocated (shipped) | 7.54 M ops/s | **0** | 89 ns | 201 ns | 274 ns | 45.4 µs |
+
+Throughput improves by 1.8x, which is the least interesting column. The worst case
+goes from 35 ms to 45 µs — a factor of 770 — and that is the whole argument for
+preallocation. A book that is usually fast and occasionally stalls for tens of
+milliseconds is a book that misses the move it was built to see.
+
+### The software path on its own
 
 `benchmarks/end_to_end` runs encode → decode → sequence → ring → book in one process,
-isolating the software cost from the kernel network stack. Paced at 1 M msg/s:
-p50 0.454 µs, p99 0.893 µs, p99.9 2.144 µs end to end. Unthrottled it sustains
-3.86 M msg/s.
+with the kernel's network stack removed, isolating the cost the code itself is
+responsible for. Paced at 1 M msg/s: **0.490 µs p50, 0.913 µs p99, 3.513 µs p99.9**
+end to end. Unthrottled it sustains 3.39 M msg/s.
 
-## The race
+## The single-producer contract
 
-`tools/spsc_race_demo` exists because the single-producer rule is easy to state and
-easy to violate. The natural way to add recovery is to let the recovery path publish
-downstream alongside the receive path — which quietly puts two producers on a queue
-built for one.
+`tools/spsc_race_demo` exists because the ring's single-writer rule is easy to state
+and easy to violate, and because a rule with no test is a comment.
 
 ```bash
 BUILD_DIR=build-tsan SANITIZER=thread ./scripts/build.sh
@@ -238,9 +282,9 @@ BUILD_DIR=build-tsan SANITIZER=thread ./scripts/build.sh
 ./build-tsan/spsc_race_demo --mode fixed  --producers 2 --messages 20000
 ```
 
-`--mode broken` puts two producers on one `SpscQueue`. ThreadSanitizer reports data
-races on the write index, on the producer-local cached read index, and on the slot
-storage itself — a producer writing a slot while the consumer reads it:
+`--mode broken` puts two producers on one ring. ThreadSanitizer reports races on the
+write index, on the producer-local cached read index, and on the slot storage itself —
+a producer writing a slot while the consumer reads it:
 
 ```
 SUMMARY: ThreadSanitizer: data race include/llte/spsc_queue.hpp:34 in try_push
@@ -251,66 +295,109 @@ sent=40000 received=40000 corrupted=39 out_of_order=925 stalled_pushes=31111
 result: STREAM DAMAGED
 ```
 
-The two producers clobber each other's index update. The observable damage varies by
-interleaving — torn payloads that fail their checksum, messages delivered out of
-order, a ring wedged into a permanently-full state, and a consumer that re-reads
-slots which were never published. Because the failure mode is nondeterministic, the
-demo runs to a wall-clock budget (`--time-budget-ms`) rather than a fixed spin count;
-across repeated runs it reports 8–12 distinct races and always ends STREAM DAMAGED.
+The visible damage varies with interleaving — payloads that fail their checksum,
+messages delivered out of order, a ring wedged into a permanently-full state, or a
+consumer re-reading slots that were never published. Because the failure is
+nondeterministic, the demo works to a wall-clock budget rather than a spin count; a
+spin budget was tried first and was not enough, since an occasional successful push
+resets it and one run took over two minutes.
 
-`--mode fixed` gives each producer its own queue and makes one sequencer thread the
-sole writer of the downstream queue — the same shape the real handler uses:
-`sent=40000 received=40000 lost=0 corrupted=0 out_of_order=0`, no sanitizer reports,
-and it finishes in ~70 ms instead of burning the budget.
+`--mode fixed` gives each producer its own ring and makes a single sequencer the only
+writer downstream, which is the shape the real handler uses: `sent=40000
+received=40000 lost=0 corrupted=0 out_of_order=0`, no sanitizer reports, finishing in
+about 70 ms. CI asserts both halves — that the misuse is caught, and that the shipped
+design is not.
 
-The shipped code is clean under both sanitizers. `SANITIZER=thread` runs the test
-suite with no race reports under `halt_on_error=1`, and `SANITIZER=address` (which
-also enables UBSan) runs both the test suite and the full three-process pipeline with
-zero findings — including the shared-memory and socket paths.
+## How the numbers were measured
 
-## Measurement methodology
+Two mistakes in the first version of these benchmarks are worth naming, because both
+produced confident numbers that meant something other than what they appeared to.
 
-Two mistakes were caught while building these benchmarks, and both are worth naming
-because they inflate results in opposite directions:
+**Saturation is not latency.** With the producer unthrottled the ring simply stays
+full, so the measured transit time is queue depth divided by throughput. The first
+in-process run reported an 18 ms p50 that was entirely backlog — 65,536 slots at
+3.57 M msg/s is 18.4 ms, which matched to three digits. Throughput is now measured
+with the producer flat out, and latency separately under a paced load below
+saturation, where the ring is near-empty.
 
-1. **Saturation is not latency.** With an unthrottled producer the ring sits full and
-   the measured transit time is just queue depth divided by throughput — the first
-   end-to-end run reported an 18 ms p50 that was entirely backlog. Latency is now
-   measured under a paced load below saturation; throughput is measured separately.
-2. **Thread startup leaks into the first samples.** The consumer allocates a ~64 MB
-   book before its first pop while the paced producer is already publishing, which
-   showed up as a 5.4 ms p99 that had nothing to do with steady state. Both benchmarks
-   now hold the producer behind a start barrier until the consumer is in its loop; the
-   same p99 then measures under 1 µs.
+**Thread startup leaks into the first samples.** The consumer allocates a ~64 MB book
+before its first pop while the paced producer is already publishing, which showed up
+as a 5.4 ms p99 with nothing to do with steady state — and got *worse* with fewer
+messages, which is what gave it away. Both benchmarks now hold the producer behind a
+start barrier until the consumer is in its loop.
 
-Percentiles come from full sorted sample sets, not reservoir sampling or bucketed
-histograms. Sample buffers are reserved up front so recording never allocates.
+Beyond that: percentiles come from full sorted sample sets rather than bucketed
+histograms, sample buffers are reserved up front so recording never allocates, the
+queue benchmark repeats every variant and reports a median with its range, and
+`CLOCK_MONOTONIC` is system-wide on Linux so stamps taken in three different
+processes are directly comparable.
+
+## Verifying it yourself
+
+```bash
+# correctness: reconstruct the book through loss, batching and recovery
+./scripts/check_pipeline.sh --messages 200000 --rate 200000 --drop-rate 0.02
+./scripts/check_pipeline.sh --messages 200000 --rate 200000 --drop-rate 0.01 --batch 8
+
+# clean under both sanitizers, including the full three-process run
+BUILD_DIR=build-tsan SANITIZER=thread   ./scripts/build.sh && ctest --test-dir build-tsan
+BUILD_DIR=build-asan SANITIZER=address  ./scripts/build.sh && ctest --test-dir build-asan
+BUILD_DIR=build-asan ./scripts/check_pipeline.sh --messages 100000 --rate 100000 --drop-rate 0.02
+
+# reproduce the measurements and regenerate every figure
+./build/queue_benchmark --messages 2000000 --repeat 7 --producer-cpu 2 --consumer-cpu 4
+./build/book_benchmark  --operations 2000000
+./scripts/run_pipeline.sh --messages 400000 --rate 200000 --drop-rate 0.02 --pin --csv /tmp/l.csv
+python3 scripts/analyze_latency.py /tmp/l.csv       # splits fast path from recovery path
+python3 scripts/make_figures.py --recovery-csv /tmp/l.csv
+```
+
+CI runs the builds, the test suites under both sanitizers, the three-process pipeline
+in three configurations, and both halves of the ownership demo on every push.
+
+`scripts/build.sh` defaults `CXX` to `g++`. Clang works when pointed at a toolchain
+whose development symlink is present:
+
+```bash
+CXX=clang++ CXXFLAGS=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13 ./scripts/build.sh
+```
 
 ## Repository layout
 
 ```
-include/llte/     protocol, message, ring buffer, book, instrumentation headers
+include/llte/     protocol, message, SPSC ring, order book, instrumentation
 exchange/         simulator, multicast publisher, TCP recovery server
 market_data/      multicast receiver, sequence manager, recovery client, handler
 orderbook/        order book and the consumer process
 ipc/              POSIX shared-memory channel
 benchmarks/       queue variants, book implementations, in-process pipeline
 tests/            order book, ring buffer, gap recovery
-tools/            SPSC ownership race demo
-scripts/          build, run the pipeline, analyze latency CSVs
+tools/            SPSC single-producer ownership demo
+scripts/          build, run, assert correctness, analyse latency, draw figures
+docs/             committed measurement logs and the figures derived from them
 ```
 
-## Limitations
+## What this is not
 
-- The simulator generates plausible order flow but does not match orders; it produces
-  a market-data stream, not executions against incoming aggressive orders.
-- Recovery is synchronous on the receive thread. See the measured cost above.
-- A gap triggers a retransmission request immediately, with no short grace period for
-  the missing message to turn up on its own. Genuinely reordered packets therefore
-  cost a TCP round trip that waiting briefly would have avoided.
-- Single symbol, single feed partition, no snapshot/refresh channel.
-- The exchange's history ring uses a mutex. It is off the measured consumer path, but
-  it is not lock-free and is not claimed to be.
+A simulation of the infrastructure patterns behind electronic market data, built to
+study networking, sequencing, recovery, lock-free IPC, book maintenance and latency
+measurement under controlled conditions. It is not a production trading system and
+does not connect to any venue.
+
+Specifically:
+
+- The simulator produces a market-data stream, not executions; it generates plausible
+  order flow and never matches an aggressive order against the book.
+- Recovery is synchronous on the receive thread, at the measured cost above.
+- A gap triggers a request immediately, with no short grace period for a reordered
+  packet to arrive on its own, so genuine reordering pays for a round trip it did not
+  need.
+- One symbol, one feed partition, no snapshot or refresh channel, so a handler that
+  starts mid-stream begins from the first sequence number it sees rather than
+  recovering the book state before it.
+- The exchange's history ring is mutex-guarded. It is off the measured consumer path,
+  but it is not lock-free and is not claimed to be.
 - Latency figures come from a shared container, not tuned hardware: no isolated cores,
-  no busy-poll NIC, no huge pages. Treat them as relative comparisons between designs
-  rather than absolute numbers for this class of system.
+  no busy-poll NIC, no huge pages, and a spinning consumer competing with whatever
+  else the host is running. Treat them as comparisons between designs measured under
+  identical conditions rather than as absolute numbers for this class of system.
