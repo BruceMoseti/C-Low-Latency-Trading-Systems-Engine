@@ -19,6 +19,15 @@
 #include "llte/latency_stats.hpp"
 #include "llte/order_book.hpp"
 
+// GCC's allocation tracking does not model a *replaced* operator new. It sees
+// container memory it believes came from the built-in operator new being released
+// through the free() below and reports a mismatch. The pairing is correct -- every
+// malloc here is matched by the corresponding free -- and the diagnostic only fires
+// in sanitizer builds, where the extra inlining exposes the allocator internals.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+
 namespace {
 std::atomic<std::uint64_t> g_allocations{0};
 }

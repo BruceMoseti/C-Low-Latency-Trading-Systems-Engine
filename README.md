@@ -261,8 +261,12 @@ across repeated runs it reports 8–12 distinct races and always ends STREAM DAM
 `--mode fixed` gives each producer its own queue and makes one sequencer thread the
 sole writer of the downstream queue — the same shape the real handler uses:
 `sent=40000 received=40000 lost=0 corrupted=0 out_of_order=0`, no sanitizer reports,
-and it finishes in ~70 ms instead of burning the budget. The shipped test suite also
-runs clean under ThreadSanitizer.
+and it finishes in ~70 ms instead of burning the budget.
+
+The shipped code is clean under both sanitizers. `SANITIZER=thread` runs the test
+suite with no race reports under `halt_on_error=1`, and `SANITIZER=address` (which
+also enables UBSan) runs both the test suite and the full three-process pipeline with
+zero findings — including the shared-memory and socket paths.
 
 ## Measurement methodology
 
@@ -301,6 +305,9 @@ scripts/          build, run the pipeline, analyze latency CSVs
 - The simulator generates plausible order flow but does not match orders; it produces
   a market-data stream, not executions against incoming aggressive orders.
 - Recovery is synchronous on the receive thread. See the measured cost above.
+- A gap triggers a retransmission request immediately, with no short grace period for
+  the missing message to turn up on its own. Genuinely reordered packets therefore
+  cost a TCP round trip that waiting briefly would have avoided.
 - Single symbol, single feed partition, no snapshot/refresh channel.
 - The exchange's history ring uses a mutex. It is off the measured consumer path, but
   it is not lock-free and is not claimed to be.
