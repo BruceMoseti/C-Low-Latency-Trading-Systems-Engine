@@ -22,18 +22,19 @@
 #include <vector>
 
 #include "llte/args.hpp"
+#include "llte/clock.hpp"
 #include "llte/spsc_queue.hpp"
 
 namespace {
 
 constexpr std::size_t kQueueCapacity = 1024;
 
-// With two producers the indexes can be clobbered into a state where the ring
-// looks permanently full, so every spin here is bounded. Livelock is one of the
-// failure modes being demonstrated; hanging the demo is not. Once a producer
-// wedges it gives up rather than burning the budget again on every message,
-// which keeps the run quick even under ThreadSanitizer.
-constexpr std::uint64_t kSpinLimit = 2'000'000;
+// Corrupted indexes can leave the ring looking permanently full, or leave the
+// producers and consumer crawling forward together without either ever reaching
+// its exit condition. How long that takes varies wildly run to run, so the whole
+// demo works to a wall-clock deadline instead of a spin count. Livelock is one of
+// the failure modes being shown; hanging is not.
+constexpr std::uint64_t kDeadlineCheckInterval = 4096;
 
 struct Item {
     std::uint64_t producer;
@@ -53,17 +54,19 @@ struct Verdict {
     std::uint64_t corrupted = 0;
     std::uint64_t out_of_order = 0;
     std::uint64_t stalled_pushes = 0;
-    bool consumer_gave_up = false;
+    bool hit_time_budget = false;
 };
 
 template <typename QueueType>
-bool push_bounded(QueueType& queue, const Item& item) {
-    for (std::uint64_t spins = 0; spins < kSpinLimit; ++spins) {
+bool push_bounded(QueueType& queue, const Item& item, std::uint64_t deadline_ns) {
+    for (std::uint64_t spins = 0;; ++spins) {
         if (queue.try_push(item)) {
             return true;
         }
+        if (spins % kDeadlineCheckInterval == 0 && llte::now_ns() > deadline_ns) {
+            return false;
+        }
     }
-    return false;
 }
 
 class Verifier {
@@ -83,6 +86,8 @@ public:
         next_expected_[item.producer] = item.sequence + 1;
     }
 
+    std::uint64_t received() const { return received_; }
+
     void publish(Verdict& verdict) const {
         verdict.received = received_;
         verdict.corrupted = corrupted_;
@@ -96,7 +101,7 @@ private:
     std::uint64_t out_of_order_ = 0;
 };
 
-Verdict run_broken(int producer_count, std::uint64_t per_producer) {
+Verdict run_broken(int producer_count, std::uint64_t per_producer, std::uint64_t deadline_ns) {
     Queue queue;
     std::atomic<int> finished{0};
     std::atomic<std::uint64_t> stalled{0};
@@ -111,7 +116,7 @@ Verdict run_broken(int producer_count, std::uint64_t per_producer) {
                                 checksum_for(static_cast<std::uint64_t>(id), i)};
                 // Two threads calling try_push on one SpscQueue: they race on the
                 // write index and can land on the same slot.
-                if (!push_bounded(queue, item)) {
+                if (!push_bounded(queue, item, deadline_ns)) {
                     stalled.fetch_add(per_producer - i, std::memory_order_relaxed);
                     break;
                 }
@@ -120,20 +125,22 @@ Verdict run_broken(int producer_count, std::uint64_t per_producer) {
         });
     }
 
+    // Inconsistent indexes also let the consumer re-read slots that were never
+    // published, so cap it at the number actually sent. Past that point the
+    // stream is already provably broken and the extra reads say nothing new.
+    const std::uint64_t expected_total = static_cast<std::uint64_t>(producer_count) * per_producer;
     Verifier verifier(producer_count);
     std::thread consumer([&] {
         Item item{};
-        std::uint64_t idle = 0;
-        for (;;) {
+        std::uint64_t spins = 0;
+        while (verifier.received() < expected_total) {
             if (queue.try_pop(item)) {
-                idle = 0;
                 verifier.check(item);
-                continue;
-            }
-            if (finished.load(std::memory_order_acquire) == producer_count && queue.empty()) {
+            } else if (finished.load(std::memory_order_acquire) == producer_count &&
+                       queue.empty()) {
                 return;
             }
-            if (++idle > kSpinLimit) {
+            if (++spins % kDeadlineCheckInterval == 0 && llte::now_ns() > deadline_ns) {
                 gave_up.store(true, std::memory_order_release);
                 return;
             }
@@ -148,12 +155,12 @@ Verdict run_broken(int producer_count, std::uint64_t per_producer) {
     Verdict verdict;
     verdict.sent = static_cast<std::uint64_t>(producer_count) * per_producer;
     verdict.stalled_pushes = stalled.load(std::memory_order_relaxed);
-    verdict.consumer_gave_up = gave_up.load(std::memory_order_acquire);
+    verdict.hit_time_budget = gave_up.load(std::memory_order_acquire);
     verifier.publish(verdict);
     return verdict;
 }
 
-Verdict run_fixed(int producer_count, std::uint64_t per_producer) {
+Verdict run_fixed(int producer_count, std::uint64_t per_producer, std::uint64_t deadline_ns) {
     // One queue per producer, so every queue still has exactly one writer.
     std::vector<std::unique_ptr<Queue>> inbound;
     inbound.reserve(producer_count);
@@ -173,7 +180,7 @@ Verdict run_fixed(int producer_count, std::uint64_t per_producer) {
             for (std::uint64_t i = 0; i < per_producer; ++i) {
                 const Item item{static_cast<std::uint64_t>(id), i,
                                 checksum_for(static_cast<std::uint64_t>(id), i)};
-                if (!push_bounded(*inbound[id], item)) {
+                if (!push_bounded(*inbound[id], item, deadline_ns)) {
                     stalled.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -188,7 +195,7 @@ Verdict run_fixed(int producer_count, std::uint64_t per_producer) {
             bool moved = false;
             for (auto& queue : inbound) {
                 if (queue->try_pop(item)) {
-                    if (!push_bounded(downstream, item)) {
+                    if (!push_bounded(downstream, item, deadline_ns)) {
                         stalled.fetch_add(1, std::memory_order_relaxed);
                     }
                     moved = true;
@@ -238,19 +245,25 @@ Verdict run_fixed(int producer_count, std::uint64_t per_producer) {
 int main(int argc, char** argv) {
     const llte::Args args(argc, argv);
     if (args.has("help")) {
-        std::printf("usage: spsc_race_demo [--mode broken|fixed] [--producers N] [--messages N]\n");
+        std::printf(
+            "usage: spsc_race_demo [--mode broken|fixed] [--producers N] [--messages N]\n"
+            "                      [--time-budget-ms N]\n");
         return 0;
     }
 
     const std::string mode = args.str("mode", "fixed");
     const int producers = static_cast<int>(args.integer("producers", 2));
     const auto per_producer = static_cast<std::uint64_t>(args.integer("messages", 200000));
+    const auto budget_ms = static_cast<std::uint64_t>(args.integer("time-budget-ms", 5000));
 
-    std::printf("spsc_race_demo: mode=%s producers=%d messages/producer=%llu\n", mode.c_str(),
-                producers, static_cast<unsigned long long>(per_producer));
+    std::printf("spsc_race_demo: mode=%s producers=%d messages/producer=%llu budget=%llums\n",
+                mode.c_str(), producers, static_cast<unsigned long long>(per_producer),
+                static_cast<unsigned long long>(budget_ms));
 
-    const Verdict verdict =
-        mode == "broken" ? run_broken(producers, per_producer) : run_fixed(producers, per_producer);
+    const std::uint64_t deadline_ns = llte::now_ns() + budget_ms * 1'000'000ULL;
+    const Verdict verdict = mode == "broken"
+                                ? run_broken(producers, per_producer, deadline_ns)
+                                : run_fixed(producers, per_producer, deadline_ns);
 
     const std::uint64_t lost =
         verdict.sent > verdict.received ? verdict.sent - verdict.received : 0;
@@ -260,12 +273,12 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(lost),
                 static_cast<unsigned long long>(verdict.corrupted),
                 static_cast<unsigned long long>(verdict.out_of_order));
-    std::printf("stalled_pushes=%llu consumer_gave_up=%s\n",
+    std::printf("stalled_pushes=%llu hit_time_budget=%s\n",
                 static_cast<unsigned long long>(verdict.stalled_pushes),
-                verdict.consumer_gave_up ? "yes" : "no");
+                verdict.hit_time_budget ? "yes" : "no");
 
     const bool clean = lost == 0 && verdict.corrupted == 0 && verdict.out_of_order == 0 &&
-                       verdict.stalled_pushes == 0 && !verdict.consumer_gave_up;
+                       verdict.stalled_pushes == 0 && !verdict.hit_time_budget;
     std::printf("result: %s\n", clean ? "stream intact" : "STREAM DAMAGED");
     // The broken mode is expected to fail; reporting it as success would defeat
     // the point of the demo.

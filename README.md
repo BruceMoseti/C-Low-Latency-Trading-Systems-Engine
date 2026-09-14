@@ -222,8 +222,8 @@ allocator and container growth pauses cost a latency-sensitive consumer.
 
 `benchmarks/end_to_end` runs encode → decode → sequence → ring → book in one process,
 isolating the software cost from the kernel network stack. Paced at 1 M msg/s:
-p50 0.563 µs, p99 1.274 µs, p99.9 3.482 µs end to end. Unthrottled it sustains
-3.38 M msg/s.
+p50 0.454 µs, p99 0.893 µs, p99.9 2.144 µs end to end. Unthrottled it sustains
+3.86 M msg/s.
 
 ## The race
 
@@ -234,8 +234,8 @@ built for one.
 
 ```bash
 BUILD_DIR=build-tsan SANITIZER=thread ./scripts/build.sh
-./build-tsan/spsc_race_demo --mode broken --producers 2 --messages 50000
-./build-tsan/spsc_race_demo --mode fixed  --producers 2 --messages 50000
+./build-tsan/spsc_race_demo --mode broken --producers 2 --messages 20000
+./build-tsan/spsc_race_demo --mode fixed  --producers 2 --messages 20000
 ```
 
 `--mode broken` puts two producers on one `SpscQueue`. ThreadSanitizer reports data
@@ -247,16 +247,22 @@ SUMMARY: ThreadSanitizer: data race include/llte/spsc_queue.hpp:34 in try_push
 SUMMARY: ThreadSanitizer: data race include/llte/spsc_queue.hpp:35 in try_push
 SUMMARY: ThreadSanitizer: data race include/llte/spsc_queue.hpp:40 in try_push
 SUMMARY: ThreadSanitizer: data race include/llte/spsc_queue.hpp:55 in try_pop
-sent=100000 received=51024 lost=48976  result: STREAM DAMAGED
+sent=40000 received=40000 corrupted=39 out_of_order=925 stalled_pushes=31111
+result: STREAM DAMAGED
 ```
 
-The two producers clobber each other's index update, the ring wedges into a
-permanently-full state, and nearly half the stream never arrives.
+The two producers clobber each other's index update. The observable damage varies by
+interleaving — torn payloads that fail their checksum, messages delivered out of
+order, a ring wedged into a permanently-full state, and a consumer that re-reads
+slots which were never published. Because the failure mode is nondeterministic, the
+demo runs to a wall-clock budget (`--time-budget-ms`) rather than a fixed spin count;
+across repeated runs it reports 8–12 distinct races and always ends STREAM DAMAGED.
 
 `--mode fixed` gives each producer its own queue and makes one sequencer thread the
 sole writer of the downstream queue — the same shape the real handler uses:
-`sent=100000 received=100000 lost=0 corrupted=0`, and no sanitizer reports. The
-shipped test suite also runs clean under ThreadSanitizer.
+`sent=40000 received=40000 lost=0 corrupted=0 out_of_order=0`, no sanitizer reports,
+and it finishes in ~70 ms instead of burning the budget. The shipped test suite also
+runs clean under ThreadSanitizer.
 
 ## Measurement methodology
 
@@ -271,7 +277,7 @@ because they inflate results in opposite directions:
    book before its first pop while the paced producer is already publishing, which
    showed up as a 5.4 ms p99 that had nothing to do with steady state. Both benchmarks
    now hold the producer behind a start barrier until the consumer is in its loop; the
-   same p99 measures 1.27 µs.
+   same p99 then measures under 1 µs.
 
 Percentiles come from full sorted sample sets, not reservoir sampling or bucketed
 histograms. Sample buffers are reserved up front so recording never allocates.
