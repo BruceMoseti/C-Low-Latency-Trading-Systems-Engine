@@ -20,6 +20,9 @@ using EventQueue = SpscQueue<PipelineEvent, kIpcQueueCapacity>;
 struct ShmChannel {
     std::atomic<std::uint32_t> ready;
     std::atomic<std::uint32_t> producer_done;
+    // Identifies the process that created this channel, so a destructor can tell
+    // "my segment" from "a segment that happens to have my name" before unlinking.
+    std::atomic<std::uint32_t> creator_pid;
     std::atomic<std::uint64_t> produced_count;
     EventQueue queue;
 };
@@ -46,7 +49,10 @@ public:
     SharedMemoryQueue& operator=(const SharedMemoryQueue&) = delete;
 
     // Creates (and zeroes) the segment, then constructs the channel in place.
-    bool create(const std::string& name, std::string& error);
+    // Fails if the name is already taken, which is how a second producer on one
+    // channel is caught; `takeover` removes an existing segment first and is only
+    // for clearing the remains of a crashed run.
+    bool create(const std::string& name, std::string& error, bool takeover = false);
 
     // Attaches to an existing segment, waiting up to `timeout_ms` for `ready`.
     bool attach(const std::string& name, int timeout_ms, std::string& error);

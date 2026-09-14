@@ -26,14 +26,23 @@ void sleep_ms(int ms) {
 
 SharedMemoryQueue::~SharedMemoryQueue() { close(); }
 
-bool SharedMemoryQueue::create(const std::string& name, std::string& error) {
-    // A stale segment from a crashed run would otherwise be reused with its old
-    // indices still set.
-    ::shm_unlink(name.c_str());
+bool SharedMemoryQueue::create(const std::string& name, std::string& error, bool takeover) {
+    // Unlinking first would defeat O_EXCL entirely, and the ring is
+    // single-producer: a second producer on one channel is a correctness failure,
+    // so it has to be refused rather than quietly allowed to share.
+    if (takeover) {
+        ::shm_unlink(name.c_str());
+    }
 
     fd_ = ::shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd_ < 0) {
-        error = errno_message("shm_open");
+        if (errno == EEXIST) {
+            error = "shared segment " + name +
+                    " already exists; another producer owns it. Pass --force-shm to "
+                    "reclaim it after a crash.";
+        } else {
+            error = errno_message("shm_open");
+        }
         return false;
     }
     if (::ftruncate(fd_, sizeof(ShmChannel)) < 0) {
@@ -54,6 +63,8 @@ bool SharedMemoryQueue::create(const std::string& name, std::string& error) {
     channel_ = new (region_) ShmChannel();
     channel_->producer_done.store(0, std::memory_order_relaxed);
     channel_->produced_count.store(0, std::memory_order_relaxed);
+    channel_->creator_pid.store(static_cast<std::uint32_t>(::getpid()),
+                                std::memory_order_relaxed);
     channel_->ready.store(kChannelReadyMagic, std::memory_order_release);
     return true;
 }
@@ -109,6 +120,14 @@ bool SharedMemoryQueue::attach(const std::string& name, int timeout_ms, std::str
 }
 
 void SharedMemoryQueue::close() {
+    // shm_unlink removes by name, not by identity, so check the mapping still
+    // belongs to this process before destroying it. Otherwise a producer exiting
+    // can delete a segment that a later producer created under the same name.
+    const bool mine =
+        owner_ && channel_ != nullptr &&
+        channel_->creator_pid.load(std::memory_order_relaxed) ==
+            static_cast<std::uint32_t>(::getpid());
+
     if (region_ != nullptr) {
         ::munmap(region_, sizeof(ShmChannel));
         region_ = nullptr;
@@ -117,7 +136,7 @@ void SharedMemoryQueue::close() {
         ::close(fd_);
         fd_ = -1;
     }
-    if (owner_ && !name_.empty()) {
+    if (mine && !name_.empty()) {
         ::shm_unlink(name_.c_str());
     }
     channel_ = nullptr;

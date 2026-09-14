@@ -57,14 +57,21 @@ public:
         return true;
     }
 
+    // Both of these read the two indexes without a snapshot, so they are only
+    // exact when called from a thread that knows the other side is not moving --
+    // the consumer after the producer has finished, or either side in a test.
+    // Concurrently they report a value that was true at some point in between.
     bool empty() const {
         return read_idx_.load(std::memory_order_acquire) ==
                write_idx_.load(std::memory_order_acquire);
     }
 
     std::size_t size() const {
-        return write_idx_.load(std::memory_order_acquire) -
-               read_idx_.load(std::memory_order_acquire);
+        const std::size_t write = write_idx_.load(std::memory_order_acquire);
+        const std::size_t read = read_idx_.load(std::memory_order_acquire);
+        // The consumer can overtake the stale `write` snapshot between the two
+        // loads, and the unsigned subtraction would then wrap to ~2^64.
+        return write > read ? write - read : 0;
     }
 
     static constexpr std::size_t capacity() { return Capacity; }

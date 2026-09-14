@@ -85,11 +85,21 @@ bool MulticastReceiver::set_receive_timeout(int milliseconds, std::string& error
 }
 
 long MulticastReceiver::receive(void* buffer, std::size_t length) {
-    const ssize_t received = ::recv(fd_, buffer, length, 0);
-    if (received < 0) {
-        return (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
+    for (;;) {
+        const ssize_t received = ::recv(fd_, buffer, length, 0);
+        if (received >= 0) {
+            return static_cast<long>(received);
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;  // the receive timeout expired, which is not an error
+        }
+        // SO_RCVTIMEO suppresses automatic restart, so a caught signal surfaces
+        // here. Retrying keeps it from being reported as a receive failure.
+        if (errno == EINTR) {
+            continue;
+        }
+        return -1;
     }
-    return static_cast<long>(received);
 }
 
 void MulticastReceiver::close() {
