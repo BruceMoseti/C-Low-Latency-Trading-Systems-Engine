@@ -1,0 +1,4 @@
+{
+  "name": "C Low-Latency Trading Systems Engine",
+  "install": "./scripts/build.sh"
+}
