@@ -8,6 +8,7 @@
 //   4. production SpscQueue    aligned indices plus producer/consumer-local
 //                              cached copies of the opposite index
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -271,13 +272,34 @@ struct Variant {
     Outcome (*run)(const RunConfig&);
 };
 
+double median_of(std::vector<double> values) {
+    std::sort(values.begin(), values.end());
+    const std::size_t middle = values.size() / 2;
+    if (values.size() % 2 == 1) {
+        return values[middle];
+    }
+    return 0.5 * (values[middle - 1] + values[middle]);
+}
+
+// Thread placement moves throughput around by more than some of the differences
+// between these variants, so a single run proves very little. Every variant is
+// repeated and reported as a median with its observed range.
+struct Repeated {
+    double throughput_median = 0.0;
+    double throughput_low = 0.0;
+    double throughput_high = 0.0;
+    double p50_median = 0.0;
+    double p99_median = 0.0;
+    double p999_median = 0.0;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const llte::Args args(argc, argv);
     if (args.has("help")) {
         std::printf(
-            "usage: queue_benchmark [--messages N] [--pace-rate PER_SEC]\n"
+            "usage: queue_benchmark [--messages N] [--pace-rate PER_SEC] [--repeat N]\n"
             "                       [--producer-cpu N] [--consumer-cpu N]\n");
         return 0;
     }
@@ -288,6 +310,7 @@ int main(int argc, char** argv) {
     config.producer_cpu = static_cast<int>(args.integer("producer-cpu", -1));
     config.consumer_cpu = static_cast<int>(args.integer("consumer-cpu", -1));
     const auto pace_rate = static_cast<std::uint64_t>(args.integer("pace-rate", 1'000'000));
+    const int repeat = std::max(1, static_cast<int>(args.integer("repeat", 5)));
 
     const std::vector<Variant> variants{
         {"1. mutex + deque", run_mutex},
@@ -296,42 +319,66 @@ int main(int argc, char** argv) {
         {"4. + cached indices (shipped)", run_spinning<llte::SpscQueue<Item, kCapacity>>},
     };
 
-    std::printf("queue_benchmark: %llu messages per variant",
-                static_cast<unsigned long long>(config.messages));
+    std::printf("queue_benchmark: %llu messages per variant, %d repeats",
+                static_cast<unsigned long long>(config.messages), repeat);
     if (config.producer_cpu >= 0 || config.consumer_cpu >= 0) {
         std::printf(" (pinned: producer=%d consumer=%d)", config.producer_cpu,
                     config.consumer_cpu);
     }
     std::printf("\n");
 
-    // Phase 1: producer runs flat out. This is the sustainable-rate measurement;
-    // the queue sits full, so its latency only reflects backlog depth.
-    config.pace_rate = 0;
-    std::printf("\nsaturation (producer unthrottled) -- throughput\n");
-    std::printf("%-30s %14s\n", "variant", "M msg/s");
-    std::printf("%-30s %14s\n", "------------------------------", "--------------");
-    std::vector<Outcome> saturated;
+    std::vector<Repeated> results;
+    results.reserve(variants.size());
+    auto us = [](std::uint64_t ns) { return static_cast<double>(ns) / 1000.0; };
+
     for (const Variant& variant : variants) {
-        saturated.push_back(variant.run(config));
-        std::printf("%-30s %14.2f\n", variant.label.c_str(),
-                    saturated.back().throughput_msg_per_sec / 1e6);
+        std::vector<double> throughputs, p50s, p99s, p999s;
+
+        // Producer unthrottled: this is the sustainable-rate measurement. The ring
+        // sits full, so its latency here would only reflect backlog depth.
+        config.pace_rate = 0;
+        for (int attempt = 0; attempt < repeat; ++attempt) {
+            throughputs.push_back(variant.run(config).throughput_msg_per_sec / 1e6);
+        }
+
+        // Held to the same offered load, below every variant's capacity, so the
+        // recorded latency is the handoff itself.
+        config.pace_rate = pace_rate;
+        for (int attempt = 0; attempt < repeat; ++attempt) {
+            const Outcome outcome = variant.run(config);
+            p50s.push_back(us(outcome.transit.p50));
+            p99s.push_back(us(outcome.transit.p99));
+            p999s.push_back(us(outcome.transit.p999));
+        }
+
+        Repeated summary;
+        summary.throughput_median = median_of(throughputs);
+        summary.throughput_low = *std::min_element(throughputs.begin(), throughputs.end());
+        summary.throughput_high = *std::max_element(throughputs.begin(), throughputs.end());
+        summary.p50_median = median_of(p50s);
+        summary.p99_median = median_of(p99s);
+        summary.p999_median = median_of(p999s);
+        results.push_back(summary);
     }
 
-    // Phase 2: hold every variant to the same offered load, well under the
-    // slowest one's capacity, so latency is the handoff cost itself.
-    config.pace_rate = pace_rate;
-    std::printf("\npaced at %.2f M msg/s -- producer-to-consumer handoff latency\n",
-                static_cast<double>(pace_rate) / 1e6);
-    std::printf("%-30s %10s %10s %10s %10s\n", "variant", "p50 us", "p99 us", "p99.9 us",
-                "max us");
-    std::printf("%-30s %10s %10s %10s %10s\n", "------------------------------", "----------",
-                "----------", "----------", "----------");
-    auto us = [](std::uint64_t ns) { return static_cast<double>(ns) / 1000.0; };
-    for (const Variant& variant : variants) {
-        const Outcome outcome = variant.run(config);
-        std::printf("%-30s %10.3f %10.3f %10.3f %10.3f\n", variant.label.c_str(),
-                    us(outcome.transit.p50), us(outcome.transit.p99), us(outcome.transit.p999),
-                    us(outcome.transit.max));
+    std::printf("\nsaturation (producer unthrottled) -- throughput, median of %d\n", repeat);
+    std::printf("%-30s %14s %16s\n", "variant", "M msg/s", "observed range");
+    std::printf("%-30s %14s %16s\n", "------------------------------", "--------------",
+                "----------------");
+    for (std::size_t i = 0; i < variants.size(); ++i) {
+        std::printf("%-30s %14.2f %7.2f -%7.2f\n", variants[i].label.c_str(),
+                    results[i].throughput_median, results[i].throughput_low,
+                    results[i].throughput_high);
+    }
+
+    std::printf("\npaced at %.2f M msg/s -- handoff latency, median of %d\n",
+                static_cast<double>(pace_rate) / 1e6, repeat);
+    std::printf("%-30s %10s %10s %10s\n", "variant", "p50 us", "p99 us", "p99.9 us");
+    std::printf("%-30s %10s %10s %10s\n", "------------------------------", "----------",
+                "----------", "----------");
+    for (std::size_t i = 0; i < variants.size(); ++i) {
+        std::printf("%-30s %10.3f %10.3f %10.3f\n", variants[i].label.c_str(),
+                    results[i].p50_median, results[i].p99_median, results[i].p999_median);
     }
     return 0;
 }
