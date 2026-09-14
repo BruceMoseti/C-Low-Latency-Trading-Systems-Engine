@@ -34,7 +34,8 @@ int main(int argc, char** argv) {
             "usage: market_data_handler [--group IP] [--port N] [--interface IP]\n"
             "                           [--recovery-host IP] [--recovery-port N]\n"
             "                           [--shm NAME] [--expect N] [--idle-ms N]\n"
-            "                           [--reorder N] [--cpu N] [--no-recovery] [--quiet]\n");
+            "                           [--startup-timeout-ms N] [--reorder N] [--cpu N]\n"
+            "                           [--no-recovery] [--quiet]\n");
         return 0;
     }
 
@@ -47,6 +48,9 @@ int main(int argc, char** argv) {
     const std::string shm_name = args.str("shm", "/llte_feed");
     const auto expect = static_cast<std::uint64_t>(args.integer("expect", 0));
     const int idle_ms = static_cast<int>(args.integer("idle-ms", 1500));
+    // Without this a handler pointed at a silent group waits forever, which looks
+    // identical to a handler that is working but has nothing to do yet.
+    const int startup_timeout_ms = static_cast<int>(args.integer("startup-timeout-ms", 15000));
     const auto reorder = static_cast<std::size_t>(args.integer("reorder", 1 << 16));
     const int cpu = static_cast<int>(args.integer("cpu", -1));
     const bool use_recovery = !args.has("no-recovery");
@@ -98,6 +102,7 @@ int main(int argc, char** argv) {
     std::uint64_t first_message_ns = 0;
     std::uint64_t last_message_ns = 0;
     int idle_elapsed_ms = 0;
+    bool startup_timed_out = false;
 
     while (g_stop == 0) {
         const long received = receiver.receive(packet, sizeof(packet));
@@ -106,12 +111,19 @@ int main(int argc, char** argv) {
             break;
         }
         if (received == 0) {
-            // Only start the idle countdown once the feed has actually begun.
-            if (first_message_ns != 0) {
-                idle_elapsed_ms += 50;
-                if (idle_elapsed_ms >= idle_ms) {
+            idle_elapsed_ms += 50;
+            // Before the feed opens the countdown is a startup timeout; afterwards
+            // it detects a feed that has gone quiet.
+            if (first_message_ns == 0) {
+                if (idle_elapsed_ms >= startup_timeout_ms) {
+                    std::fprintf(stderr,
+                                 "handler: no message on %s:%u within %d ms; giving up\n",
+                                 group.c_str(), port, startup_timeout_ms);
+                    startup_timed_out = true;
                     break;
                 }
+            } else if (idle_elapsed_ms >= idle_ms) {
+                break;
             }
             continue;
         }
@@ -202,5 +214,5 @@ int main(int argc, char** argv) {
         timespec ts{0, 10'000'000L};
         ::nanosleep(&ts, nullptr);
     }
-    return 0;
+    return startup_timed_out ? 1 : 0;
 }
