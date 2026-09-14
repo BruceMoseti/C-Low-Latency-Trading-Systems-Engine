@@ -1,6 +1,7 @@
 #include "llte/order_book.hpp"
 
 #include <random>
+#include <vector>
 #include <unordered_map>
 #include <vector>
 
@@ -45,6 +46,15 @@ void test_rejects_bad_input() {
     CHECK(book.execute(999, 10) == Result::UnknownOrder);
 }
 
+// Reads the resting queue at a price, so assertions can be about position and not
+// just about totals. Level quantity and order count are identical under FIFO and
+// LIFO, so a test that only checks those cannot see time priority at all.
+std::vector<std::uint64_t> queue_at(const OrderBook& book, Side side, Price price) {
+    std::uint64_t ids[16] = {};
+    const std::size_t count = book.order_ids_at(side, price, ids, 16);
+    return std::vector<std::uint64_t>(ids, ids + count);
+}
+
 void test_price_time_priority() {
     OrderBook book = make_book();
     book.add(1, Side::Buy, 18700, 100);
@@ -53,15 +63,67 @@ void test_price_time_priority() {
     CHECK_EQ(book.order_count_at(Side::Buy, 18700), 3u);
     CHECK_EQ(book.quantity_at(Side::Buy, 18700), 600u);
 
-    // Shrinking in place must keep the order at the front of the queue.
+    // Arrival order is queue order.
+    CHECK(queue_at(book, Side::Buy, 18700) == (std::vector<std::uint64_t>{1, 2, 3}));
+
+    // Shrinking at the same price keeps position.
     CHECK(book.modify(1, 18700, 50) == Result::Ok);
     CHECK_EQ(book.quantity_at(Side::Buy, 18700), 550u);
-    CHECK_EQ(book.order_count_at(Side::Buy, 18700), 3u);
+    CHECK(queue_at(book, Side::Buy, 18700) == (std::vector<std::uint64_t>{1, 2, 3}));
 
-    // A size increase gives up time priority but keeps the level consistent.
+    // A modify that changes nothing must not cost position either.
+    CHECK(book.modify(1, 18700, 50) == Result::Ok);
+    CHECK(queue_at(book, Side::Buy, 18700) == (std::vector<std::uint64_t>{1, 2, 3}));
+
+    // A size increase goes to the back of the queue.
     CHECK(book.modify(1, 18700, 400) == Result::Ok);
     CHECK_EQ(book.quantity_at(Side::Buy, 18700), 900u);
     CHECK_EQ(book.order_count_at(Side::Buy, 18700), 3u);
+    CHECK(queue_at(book, Side::Buy, 18700) == (std::vector<std::uint64_t>{2, 3, 1}));
+
+    // A price change joins the back of its new level.
+    book.add(4, Side::Buy, 18690, 10);
+    CHECK(book.modify(2, 18690, 20) == Result::Ok);
+    CHECK(queue_at(book, Side::Buy, 18690) == (std::vector<std::uint64_t>{4, 2}));
+    CHECK(queue_at(book, Side::Buy, 18700) == (std::vector<std::uint64_t>{3, 1}));
+
+    // Cancelling from the middle preserves the order of the rest.
+    book.add(5, Side::Buy, 18700, 10);
+    CHECK(queue_at(book, Side::Buy, 18700) == (std::vector<std::uint64_t>{3, 1, 5}));
+    CHECK(book.cancel(1) == Result::Ok);
+    CHECK(queue_at(book, Side::Buy, 18700) == (std::vector<std::uint64_t>{3, 5}));
+
+    // A partial fill leaves the order where it was.
+    CHECK(book.execute(3, 1) == Result::Ok);
+    CHECK(queue_at(book, Side::Buy, 18700) == (std::vector<std::uint64_t>{3, 5}));
+}
+
+// The digest is what the end-to-end check compares across processes, so it has to
+// notice a difference that the aggregate accessors cannot.
+void test_digest_detects_queue_order() {
+    OrderBook first = make_book();
+    first.add(1, Side::Buy, 18700, 100);
+    first.add(2, Side::Buy, 18700, 100);
+
+    OrderBook second = make_book();
+    second.add(2, Side::Buy, 18700, 100);
+    second.add(1, Side::Buy, 18700, 100);
+
+    // Same orders, same level totals, opposite queue order.
+    CHECK_EQ(second.quantity_at(Side::Buy, 18700), first.quantity_at(Side::Buy, 18700));
+    CHECK_EQ(second.order_count_at(Side::Buy, 18700), first.order_count_at(Side::Buy, 18700));
+    CHECK_EQ(second.best_bid(), first.best_bid());
+    CHECK(first.structural_digest() != second.structural_digest());
+
+    // And it is stable for books built the same way.
+    OrderBook third = make_book();
+    third.add(1, Side::Buy, 18700, 100);
+    third.add(2, Side::Buy, 18700, 100);
+    CHECK_EQ(third.structural_digest(), first.structural_digest());
+
+    // A quantity difference at one level must change it too.
+    CHECK(third.modify(2, 18700, 99) == Result::Ok);
+    CHECK(third.structural_digest() != first.structural_digest());
 }
 
 void test_modify_moves_levels() {
@@ -95,8 +157,9 @@ void test_execute_and_cancel() {
     CHECK(!book.contains(1));
     CHECK_EQ(book.quantity_at(Side::Sell, 18800), 100u);
 
-    // An oversized fill also removes it rather than underflowing the level.
-    CHECK(book.execute(2, 999) == Result::Ok);
+    // An oversized fill still removes the order, but it must be reported: it can
+    // only happen if an Add or Modify for that order never arrived.
+    CHECK(book.execute(2, 999) == Result::OverFilled);
     CHECK_EQ(book.quantity_at(Side::Sell, 18800), 0u);
     CHECK_EQ(book.best_ask(), 18810);
 
@@ -186,6 +249,7 @@ int main() {
     test_add_and_touch();
     test_rejects_bad_input();
     test_price_time_priority();
+    test_digest_detects_queue_order();
     test_modify_moves_levels();
     test_execute_and_cancel();
     test_pool_exhaustion();

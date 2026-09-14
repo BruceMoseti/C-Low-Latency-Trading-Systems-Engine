@@ -1,7 +1,7 @@
 #include "llte/order_book.hpp"
 
 #include <bit>
-#include <cassert>
+#include <stdexcept>
 
 namespace llte {
 namespace {
@@ -23,8 +23,15 @@ OrderBook::OrderBook(const Config& config)
       live_orders_(0),
       best_bid_level_(kNoLevel),
       best_ask_level_(kNoLevel) {
-    assert(config.max_price >= config.min_price);
-    assert(config.max_orders > 0);
+    // Not an assert: the shipped build defines NDEBUG, and a reversed band would
+    // then turn into a negative level count cast to size_t and an uncaught
+    // length_error from the allocation below.
+    if (config.max_price < config.min_price) {
+        throw std::invalid_argument("OrderBook: max_price is below min_price");
+    }
+    if (config.max_orders == 0) {
+        throw std::invalid_argument("OrderBook: max_orders must be non-zero");
+    }
 
     const std::size_t level_count =
         static_cast<std::size_t>(config.max_price - config.min_price) + 1;
@@ -216,9 +223,10 @@ OrderBook::Result OrderBook::modify(std::uint64_t order_id, Price new_price,
     Order& order = pool_[slot];
     const std::size_t old_level = level_index(order.price);
 
-    // Exchange semantics: shrinking in place keeps time priority, while a price
-    // change or a size increase sends the order to the back of the queue.
-    if (new_price == order.price && new_quantity < order.quantity) {
+    // Exchange semantics: holding or shrinking at the same price keeps time
+    // priority, while a price change or a size increase sends the order to the
+    // back of its new queue. A modify that changes nothing must not cost position.
+    if (new_price == order.price && new_quantity <= order.quantity) {
         Level& level = levels_for(order.side)[old_level];
         level.total_quantity -= (order.quantity - new_quantity);
         order.quantity = new_quantity;
@@ -249,11 +257,12 @@ OrderBook::Result OrderBook::execute(std::uint64_t order_id, std::uint32_t quant
     const std::size_t level_idx = level_index(order.price);
 
     if (quantity >= order.quantity) {
+        const bool over_filled = quantity > order.quantity;
         unlink(level_idx, order.side, slot);
         index_erase(position);
         release_slot(slot);
         live_orders_ -= 1;
-        return Result::Ok;
+        return over_filled ? Result::OverFilled : Result::Ok;
     }
 
     levels_for(order.side)[level_idx].total_quantity -= quantity;
@@ -285,6 +294,48 @@ std::uint32_t OrderBook::order_count_at(Side side, Price price) const {
 
 bool OrderBook::contains(std::uint64_t order_id) const {
     return find_index(order_id) != kNoLevel;
+}
+
+std::size_t OrderBook::order_ids_at(Side side, Price price, std::uint64_t* out,
+                                    std::size_t capacity) const {
+    if (!in_band(price)) {
+        return 0;
+    }
+    std::size_t written = 0;
+    std::uint32_t slot = levels_for(side)[level_index(price)].head;
+    while (slot != kNullOrder && written < capacity) {
+        out[written++] = pool_[slot].id;
+        slot = pool_[slot].next;
+    }
+    return written;
+}
+
+std::uint64_t OrderBook::structural_digest() const {
+    std::uint64_t digest = 0xcbf29ce484222325ULL;
+    auto absorb = [&digest](std::uint64_t value) { digest = mix(digest ^ value); };
+
+    for (const Side side : {Side::Buy, Side::Sell}) {
+        const std::vector<Level>& levels = levels_for(side);
+        absorb(static_cast<std::uint64_t>(side));
+        for (std::size_t index = 0; index < levels.size(); ++index) {
+            const Level& level = levels[index];
+            if (level.order_count == 0) {
+                continue;
+            }
+            absorb(static_cast<std::uint64_t>(level_price(index)));
+            absorb(level.order_count);
+            absorb(level.total_quantity);
+            // Walking the intrusive list in order folds queue position into the
+            // digest, so two books that agree on depth but not on time priority
+            // still disagree here.
+            for (std::uint32_t slot = level.head; slot != kNullOrder;
+                 slot = pool_[slot].next) {
+                absorb(pool_[slot].id);
+                absorb(pool_[slot].quantity);
+            }
+        }
+    }
+    return digest;
 }
 
 std::uint64_t OrderBook::mix(std::uint64_t key) {

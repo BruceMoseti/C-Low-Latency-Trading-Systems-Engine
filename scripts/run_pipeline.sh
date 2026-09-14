@@ -13,6 +13,7 @@ messages=200000
 drop_rate=0
 rate=0
 batch=1
+seed=42
 out_dir=""
 csv=""
 pin=0
@@ -23,6 +24,7 @@ while [[ $# -gt 0 ]]; do
     --drop-rate) drop_rate="$2"; shift 2 ;;
     --rate) rate="$2"; shift 2 ;;
     --batch) batch="$2"; shift 2 ;;
+    --seed) seed="$2"; shift 2 ;;
     --out) out_dir="$2"; shift 2 ;;
     --csv) csv="$2"; shift 2 ;;
     --pin) pin=1; shift ;;
@@ -60,13 +62,14 @@ if [[ -n "${csv}" ]]; then
 fi
 
 echo "run directory: ${out_dir}"
-echo "messages=${messages} drop-rate=${drop_rate} rate=${rate} batch=${batch} pin=${pin}"
+echo "messages=${messages} drop-rate=${drop_rate} rate=${rate} batch=${batch} seed=${seed} pin=${pin}"
 echo
 
 # The handler connects to the exchange's recovery server at startup, so the
 # exchange goes first; its start delay holds the feed until subscribers are up.
 "${build_dir}/exchange_simulator" \
   --messages "${messages}" --drop-rate "${drop_rate}" --rate "${rate}" --batch "${batch}" \
+  --seed "${seed}" \
   --start-delay-ms 1500 --linger-ms 3000 "${exchange_cpu[@]}" \
   > "${out_dir}/exchange.log" 2>&1 &
 exchange_pid=$!

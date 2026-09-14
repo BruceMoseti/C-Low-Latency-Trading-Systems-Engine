@@ -26,6 +26,8 @@ struct ApplyCounters {
     std::uint64_t out_of_band = 0;
     std::uint64_t pool_exhausted = 0;
     std::uint64_t invalid = 0;
+    std::uint64_t over_filled = 0;
+    std::uint64_t unexpected_heartbeat = 0;
 };
 
 void record(ApplyCounters& counters, llte::OrderBook::Result result) {
@@ -36,6 +38,10 @@ void record(ApplyCounters& counters, llte::OrderBook::Result result) {
         case llte::OrderBook::Result::PriceOutOfBand: counters.out_of_band += 1; break;
         case llte::OrderBook::Result::PoolExhausted: counters.pool_exhausted += 1; break;
         case llte::OrderBook::Result::InvalidQuantity: counters.invalid += 1; break;
+        // A fill larger than the resting order means an Add or Modify was missed.
+        // It is the clearest desync signal the feed offers, so it is counted rather
+        // than absorbed as a clean full fill.
+        case llte::OrderBook::Result::OverFilled: counters.over_filled += 1; break;
     }
 }
 
@@ -47,7 +53,8 @@ int main(int argc, char** argv) {
         std::printf(
             "usage: order_book_engine [--shm NAME] [--min-price N] [--max-price N]\n"
             "                         [--max-orders N] [--samples N] [--csv PATH]\n"
-            "                         [--cpu N] [--attach-timeout-ms N] [--quiet]\n");
+            "                         [--cpu N] [--attach-timeout-ms N]\n"
+            "                         [--stall-timeout-ms N] [--quiet]\n");
         return 0;
     }
 
@@ -59,11 +66,12 @@ int main(int argc, char** argv) {
     const std::string csv_path = args.str("csv", "");
     const int cpu = static_cast<int>(args.integer("cpu", -1));
     const int attach_timeout_ms = static_cast<int>(args.integer("attach-timeout-ms", 10000));
+    const int stall_timeout_ms = static_cast<int>(args.integer("stall-timeout-ms", 30000));
     const bool quiet = args.has("quiet");
 
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
-    llte::pin_to_cpu(cpu);
+    llte::pin_to_cpu_or_warn(cpu, "engine");
 
     std::string error;
     llte::SharedMemoryQueue shm;
@@ -102,7 +110,14 @@ int main(int argc, char** argv) {
     std::uint64_t recovered_seen = 0;
     std::uint64_t first_ns = 0;
     std::uint64_t last_ns = 0;
+    bool stalled = false;
     llte::PipelineEvent event;
+
+    // A producer that dies never sets producer_done, and the consumer would
+    // otherwise spin on an empty ring forever at 100% of a core.
+    const std::uint64_t stall_limit_ns =
+        static_cast<std::uint64_t>(stall_timeout_ms) * 1'000'000ULL;
+    std::uint64_t last_progress_ns = llte::now_ns();
 
     while (g_stop == 0) {
         if (!channel->queue.try_pop(event)) {
@@ -110,8 +125,17 @@ int main(int argc, char** argv) {
                 channel->queue.empty()) {
                 break;
             }
+            if (stall_limit_ns > 0 && llte::now_ns() - last_progress_ns > stall_limit_ns) {
+                std::fprintf(stderr,
+                             "engine: no event for %d ms and the producer never finished; "
+                             "giving up after %llu events\n",
+                             stall_timeout_ms, static_cast<unsigned long long>(consumed));
+                stalled = true;
+                break;
+            }
             continue;
         }
+        last_progress_ns = llte::now_ns();
 
         const std::uint64_t t3_dequeue = llte::now_ns();
         const llte::MarketMessage& message = event.msg;
@@ -129,6 +153,12 @@ int main(int argc, char** argv) {
                 break;
             case llte::MessageType::Trade:
                 record(counters, book.execute(message.order_id, message.quantity));
+                break;
+            case llte::MessageType::Heartbeat:
+                // The handler consumes these; one reaching the book would mean the
+                // sequencer had published a non-event, so count it rather than
+                // silently applying nothing.
+                counters.unexpected_heartbeat += 1;
                 break;
         }
         const std::uint64_t t4_book = llte::now_ns();
@@ -183,9 +213,24 @@ int main(int argc, char** argv) {
                     static_cast<long long>(book.best_ask()),
                     static_cast<long long>(book.best_ask() - book.best_bid()),
                     book.live_order_count());
+        std::printf("engine: book_digest=%016llx\n",
+                    static_cast<unsigned long long>(book.structural_digest()));
+        std::printf("engine: over_filled=%llu unexpected_heartbeat=%llu\n",
+                    static_cast<unsigned long long>(counters.over_filled),
+                    static_cast<unsigned long long>(counters.unexpected_heartbeat));
         if (seconds > 0.0) {
             std::printf("engine: consumer throughput %.0f msg/s\n",
                         static_cast<double>(consumed) / seconds);
+        }
+
+        const std::uint64_t samples_dropped =
+            parse_stage.dropped() + enqueue_stage.dropped() + queue_stage.dropped() +
+            book_stage.dropped() + handler_to_book.dropped() + wire_to_book.dropped();
+        if (samples_dropped > 0) {
+            std::printf(
+                "engine: WARNING %llu latency samples dropped; percentiles cover only\n"
+                "        the first --samples events, biased toward the start of the run\n",
+                static_cast<unsigned long long>(samples_dropped));
         }
 
         std::printf("\nPer-stage latency (microseconds)\n");
@@ -198,5 +243,5 @@ int main(int argc, char** argv) {
         llte::print_summary_row("exchange -> book (wire)", wire_to_book.summarize());
         std::fflush(stdout);
     }
-    return 0;
+    return stalled ? 1 : 0;
 }

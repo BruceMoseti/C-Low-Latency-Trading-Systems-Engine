@@ -28,6 +28,10 @@ public:
         PriceOutOfBand,
         PoolExhausted,
         InvalidQuantity,
+        // A fill larger than the resting quantity. The order is still removed,
+        // but this means an Add or Modify was missed, so it is reported rather
+        // than rounded down into a clean full fill.
+        OverFilled,
     };
 
     struct Config {
@@ -50,6 +54,19 @@ public:
     std::uint32_t order_count_at(Side side, Price price) const;
     bool contains(std::uint64_t order_id) const;
     std::size_t live_order_count() const { return live_orders_; }
+
+    // Copies the order ids resting at a price, in queue order. Without this the
+    // public surface exposes only aggregates, and time priority cannot be tested:
+    // a book that served every level LIFO would satisfy all the other accessors.
+    std::size_t order_ids_at(Side side, Price price, std::uint64_t* out,
+                             std::size_t capacity) const;
+
+    // Fingerprint of the entire book: every occupied level on both sides, and the
+    // id and quantity of every resting order in queue order. Two books with the
+    // same digest hold the same orders at the same prices in the same positions,
+    // so comparing digests across processes is a structural check rather than a
+    // comparison of a few aggregates.
+    std::uint64_t structural_digest() const;
 
     void clear();
 
